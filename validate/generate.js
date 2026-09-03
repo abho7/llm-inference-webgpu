@@ -9,6 +9,10 @@
 //
 //   node validate/generate.js "The capital of France is" 8
 
+// Durations use performance.now(), which is monotonic. Date.now() is wall
+// clock: it jumps when the system clock is corrected, and a run of this script
+// once reported a 3-pass comparison as taking 14.7 hours because of exactly
+// that. A benchmark must never measure itself with a clock that can move.
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -37,16 +41,16 @@ console.log(`        ${ids.length} tokens [${ids.join(', ')}]\n`);
 
 const eos = new Set([151645, 151643]); // <|im_end|>, <|endoftext|>
 const generated = [];
-const started = Date.now();
+const started = performance.now();
 
 for (let step = 0; step < wanted; step++) {
-  const stepStarted = Date.now();
+  const stepStarted = performance.now();
   const { logits } = await model.forward([...ids, ...generated]);
 
   let best = 0;
   for (let i = 1; i < logits.length; i++) if (logits[i] > logits[best]) best = i;
 
-  const seconds = (Date.now() - stepStarted) / 1000;
+  const seconds = (performance.now() - stepStarted) / 1000;
   const context = ids.length + generated.length;
   console.log(`  ${String(step).padStart(2)}  ${String(best).padStart(6)}  ` +
     `${JSON.stringify(tokenizer.idToToken(best)).padEnd(16)}  ` +
@@ -60,7 +64,7 @@ for (let step = 0; step < wanted; step++) {
   }
 }
 
-const elapsed = (Date.now() - started) / 1000;
+const elapsed = (performance.now() - started) / 1000;
 console.log(`\ncontinuation: ${JSON.stringify(tokenizer.decode(generated))}`);
 console.log(`full text:    ${JSON.stringify(tokenizer.decode([...ids, ...generated]))}`);
 console.log(`\n${generated.length} tokens in ${elapsed.toFixed(1)}s ` +

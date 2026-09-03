@@ -6,3 +6,5 @@ weights/
 
 node_modules/
 .DS_Store
+phase2.log
+suite.log
