@@ -141,6 +141,24 @@ export class Safetensors {
   }
 
   /**
+   * A byte range within one tensor, offset from that tensor's own start.
+   *
+   * The point of this is the tied output projection: the embedding matrix is
+   * 272 MB of bfloat16 and 544 MB widened, so the logit computation walks it in
+   * row blocks instead of ever holding it. Bounds are checked against the
+   * tensor rather than the file, so a slice cannot silently read a neighbour.
+   */
+  async readRawRange(name, offset, length) {
+    const t = this.info(name);
+    if (offset < 0 || length < 0 || offset + length > t.byteLength) {
+      throw new RangeError(
+        `${name}: range ${offset}+${length} outside a ${t.byteLength}-byte tensor`,
+      );
+    }
+    return this.#source.read(this.#dataStart + t.begin + offset, length);
+  }
+
+  /**
    * The tensor widened to f32, whatever it was stored as.
    *
    * Callers can pass `out` to reuse a buffer, which matters in the decode loop

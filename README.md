@@ -9,9 +9,10 @@ No PyTorch, no `transformers`, no tokenizer library. The safetensors container,
 the bfloat16 conversion, the BPE tokenizer, the attention kernels and the
 quantization are all in this repository.
 
-> **Status: Phase 0 of 6.** The model loads and the tokenizer is exact. The
-> forward pass is not written yet, so this does not generate text. The table
-> below marks what is actually done; nothing is claimed before it is measured.
+> **Status: Phase 1 of 6.** The model runs and generates text that matches an
+> independent implementation token for token. It is extremely slow -- there is
+> no KV cache yet and no GPU backend -- and the table below marks what is
+> actually done. Nothing is claimed before it is measured.
 
 ## What this sets out to prove
 
@@ -22,11 +23,76 @@ already do that. The claims worth making are narrower and checkable:
 |---|-------|-------|--------|
 | 1 | Weights load bit-exactly, and the config matches them | 0 | **done** |
 | 2 | Tokenization is identical to the reference on a corpus | 0 | **done** |
-| 3 | Logits match ONNX Runtime to a stated tolerance, per layer | 1 | not started |
+| 3 | Logits match ONNX Runtime to a stated tolerance, per layer | 1 | **done** |
 | 4 | Incremental decode with a KV cache equals full recomputation | 2 | not started |
 | 5 | The WebGPU backend matches the CPU reference within f16 tolerance | 3 | not started |
 | 6 | Quantization error is characterised per layer, not just end to end | 4 | not started |
 | 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | not started |
+
+## Phase 1: the forward pass agrees with ONNX Runtime
+
+The whole architecture is in `src/cpu/model.js`: RMSNorm, the Q/K/V
+projections with Qwen2's asymmetric biases, rotary embeddings, causal
+grouped-query attention at seven query heads per key/value head, SwiGLU, and a
+tied output projection. About 200 lines, written to be read.
+
+**The check is per layer, not just at the output.** The ONNX export publishes
+`present.N.key` and `present.N.value` for all 24 layers as ordinary graph
+outputs. Those are the post-RoPE keys and the values at every position of every
+layer, so matching them exercises the embedding, both norms, all three
+projections, the rotary embedding and the head grouping *per layer* -- and it
+needs no graph surgery to get at them. If layer 7 agrees, everything feeding
+layer 7 agreed.
+
+Measured over five prompts, 48 tensors each:
+
+| | worst relative | worst absolute | bound |
+|---|---|---|---|
+| per-layer keys and values | 9.1e-5 | 6.7e-4 | 5e-4 |
+| logits at the final position | 6.6e-6 | 1.1e-4 | 1e-4 |
+| argmax | identical on 5 of 5 | | exact |
+| top-10 ordering | identical on 5 of 5 | | exact |
+
+Both implementations store f32 and sum in different orders, so exact agreement
+is impossible; the question is only whether the drift is explainable. A dot
+product over 896 terms carries roughly `sqrt(896) * 2^-24`, about 2e-6
+relative, and 24 layers compound it. The bounds sit a few times above the
+measured worst case: float non-associativity cannot reach them, and a real
+defect -- a swapped RoPE convention, a mis-grouped attention head, an epsilon
+outside the square root -- overshoots them by orders of magnitude.
+
+The argmax and top-10 checks are the ones with no tolerance at all. The argmax
+is what actually decides the generated token, and the top-10 ordering
+constrains ten values that often sit within tenths of each other, so a
+systematic bias would break it even while every individual logit stayed inside
+tolerance.
+
+**End to end**, greedy decoding from `"The capital of France is"` produces
+`" Paris. It is the largest city in"` -- the same eight tokens ONNX Runtime
+produces, in the same order.
+
+It does so at **0.06 tokens per second**. There is no KV cache, so generating
+token *n* recomputes the whole sequence, and every step re-streams all 988 MB
+of weights from disk. Both are phase 2 and phase 3 problems, and the number is
+recorded here so the improvement has something to be measured against.
+
+### Why the error jumps at layer 22
+
+The per-layer agreement degrades smoothly through the stack and then jumps by
+about an order of magnitude at layer 22, in every prompt rather than one. A
+jump like that is either a bug in that layer or a property of the model, and
+the error alone cannot tell them apart.
+
+`validate/activation-scale.js` measures the statistic that does. Qwen2.5
+concentrates its hidden state in a few channels: channel 490 grows steadily
+from 3.5 at layer 1 to 66.5 at layer 22, reaching 27 times the RMS of the whole
+vector. RMSNorm then divides everything by a number those few channels set, and
+the projection that follows sums 896 terms in which one dominates the rest.
+That is catastrophic cancellation, and it inflates absolute error without
+anything being wrong. The error peaks exactly where the concentration does.
+
+This is not just an explanation, it is a preview: outlier channels like 490 are
+precisely what makes per-tensor quantization fail, which is phase 4's problem.
 
 ## Phase 0: what is established, and how
 
@@ -106,7 +172,7 @@ would have been. It is already confirmed working end to end: a greedy decode of
 
 ```
 src/core/     backend-agnostic: dtypes, safetensors, config, tokenizer
-src/cpu/      f32 reference forward pass                    (phase 1)
+src/cpu/      the reference forward pass, f32 storage and f64 sums
 src/gpu/      WebGPU compute backend                        (phase 3)
 oracle/       independent implementations, used only to generate golden files
 golden/       committed outputs of the oracle scripts
@@ -125,8 +191,13 @@ python oracle/fetch_weights.py     # ~1 GB from Hugging Face, into weights/
 python oracle/tensor_digest.py     # regenerate golden/tensor_digest.json
 python oracle/make_corpus.py       # regenerate test/corpus.json
 python oracle/tokenize_corpus.py   # regenerate golden/tokenizer_cases.json
-node --test                        # 36 tests
-node validate/phase0.js            # the gate report
+python oracle/dump_reference.py    # golden/reference/, needs the ~2 GB ONNX model
+node --test                        # 61 tests
+node validate/phase0.js            # loader and tokenizer gate
+node validate/phase1.js            # forward-pass gate against ONNX Runtime
+node validate/generate.js "The capital of France is" 8
+node validate/layer-profile.js 3   # where the disagreement grows
+node validate/activation-scale.js  # which channels are outliers
 ```
 
 The weights are not committed. The golden files are, so the test suite is
