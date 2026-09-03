@@ -1,0 +1,8 @@
+# Model weights: ~1 GB, fetched by oracle/fetch_weights.py.
+weights/
+
+# The ONNX oracle model is ~2 GB and lives outside the repo.
+*.onnx
+
+node_modules/
+.DS_Store

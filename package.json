@@ -1,0 +1,12 @@
+{
+  "name": "llm-inference-webgpu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A transformer inference engine written from scratch, validated against an independent implementation.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test",
+    "validate": "node validate/run.js"
+  }
+}
