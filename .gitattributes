@@ -1,0 +1,10 @@
+# Normalise to LF everywhere. This repo's golden files are compared byte for
+# byte against regenerated output, so line endings that change on checkout
+# would make a clean clone look like a failure.
+* text=auto eol=lf
+
+# Never touched at all: the corpus deliberately contains carriage returns and
+# other whitespace the tokenizer has to handle, and the golden ids were
+# produced from exactly these bytes.
+test/corpus.json     -text
+golden/**            -text
