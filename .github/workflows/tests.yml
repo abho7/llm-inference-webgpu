@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'   # Float16Array, used as the f16 conversion oracle
+          node-version: '24'   # Float16Array, used as the f16 conversion oracle
 
       # tokenizer.json is 7 MB, so the corpus gate -- 3098 cases against ids
       # produced by the reference Rust tokenizer -- runs here rather than

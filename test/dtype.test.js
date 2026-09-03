@@ -12,6 +12,15 @@ import {
 
 const ALL = 0x10000;
 
+// Float16Array is the independent oracle for the f16 conversions: it is V8's
+// own C++ implementation, so agreeing with it means something. It landed in
+// Node 24. On anything older the f16 tests skip with a reason rather than
+// failing with a bare ReferenceError.
+const HAVE_F16_ORACLE = typeof Float16Array === 'function';
+const needsOracle = HAVE_F16_ORACLE
+  ? false
+  : 'Float16Array requires Node 24 or newer';
+
 const bits = new ArrayBuffer(4);
 const asU32 = new Uint32Array(bits);
 const asF32 = new Float32Array(bits);
@@ -96,7 +105,7 @@ test('bf16 preserves NaN as NaN', () => {
 });
 
 
-test('f16 widening matches Float16Array on all 65536 values', () => {
+test('f16 widening matches Float16Array on all 65536 values', { skip: needsOracle }, () => {
   const oracle = new Float16Array(1);
   const oracleBits = new Uint16Array(oracle.buffer);
   for (let h = 0; h < ALL; h++) {
@@ -112,7 +121,7 @@ test('f16 widening matches Float16Array on all 65536 values', () => {
   }
 });
 
-test('f16 narrowing matches Float16Array on all 65536 round-trip inputs', () => {
+test('f16 narrowing matches Float16Array on all 65536 round-trip inputs', { skip: needsOracle }, () => {
   const oracle = new Float16Array(1);
   const oracleBits = new Uint16Array(oracle.buffer);
   for (let h = 0; h < ALL; h++) {
@@ -124,7 +133,7 @@ test('f16 narrowing matches Float16Array on all 65536 round-trip inputs', () => 
   }
 });
 
-test('f16 narrowing matches Float16Array on values between representable ones', () => {
+test('f16 narrowing matches Float16Array on values between representable ones', { skip: needsOracle }, () => {
   // Round-tripping only exercises inputs that are already f16-exact, which
   // never tests the rounding logic. These are the inputs that do: midpoints,
   // subnormals, and the overflow boundary.

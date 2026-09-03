@@ -133,7 +133,9 @@ The weights are not committed. The golden files are, so the test suite is
 meaningful on a fresh clone; the tests that need the weights skip rather than
 fail when they are absent.
 
-Requires Node 22 or newer for `Float16Array`.
+Requires Node 24 or newer: the f16 tests use `Float16Array` as their oracle,
+and it is not available before then. On an older runtime those three tests
+skip rather than fail.
 
 ## Hardware these numbers refer to
 
