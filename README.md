@@ -9,10 +9,11 @@ No PyTorch, no `transformers`, no tokenizer library. The safetensors container,
 the bfloat16 conversion, the BPE tokenizer, the attention kernels and the
 quantization are all in this repository.
 
-> **Status: Phase 1 of 6.** The model runs and generates text that matches an
-> independent implementation token for token. It is extremely slow -- there is
-> no KV cache yet and no GPU backend -- and the table below marks what is
-> actually done. Nothing is claimed before it is measured.
+> **Status: Phase 2 of 6.** The model runs, caches its keys and values, and
+> generates text that matches an independent implementation token for token. It
+> is still slow: there is no GPU backend yet, so everything below runs in scalar
+> JavaScript. The table marks what is actually done, and nothing is claimed
+> before it is measured.
 
 ## What this sets out to prove
 
@@ -24,10 +25,87 @@ already do that. The claims worth making are narrower and checkable:
 | 1 | Weights load bit-exactly, and the config matches them | 0 | **done** |
 | 2 | Tokenization is identical to the reference on a corpus | 0 | **done** |
 | 3 | Logits match ONNX Runtime to a stated tolerance, per layer | 1 | **done** |
-| 4 | Incremental decode with a KV cache equals full recomputation | 2 | not started |
+| 4 | Incremental decode with a KV cache equals full recomputation | 2 | **done** |
 | 5 | The WebGPU backend matches the CPU reference within f16 tolerance | 3 | not started |
 | 6 | Quantization error is characterised per layer, not just end to end | 4 | not started |
 | 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | not started |
+
+## Phase 2: the KV cache, checked exactly
+
+Attention at position *t* needs every key and value up to *t*. Phase 1
+recomputed them all on every step, which is why it managed 0.06 tokens per
+second. The cache keeps them instead.
+
+**The gate admits no tolerance.** Position *s*'s key depends only on positions
+up to *s*, so the value computed while *s* was the newest token is the value a
+full recomputation produces later -- the same bits, not merely close. So the
+comparison is on f32 bit patterns, over all 48 per-layer tensors and all
+151,936 logits, for three different ways of splitting the same sequence:
+
+| split | passes | keys and values | logits |
+|---|---|---|---|
+| one token at a time | 7 | identical | identical |
+| prefill then decode | 3 | identical | identical |
+| uneven chunks | 3 | identical | identical |
+
+What makes that achievable rather than lucky is that there is only one code
+path. Passing no cache means "use a fresh one", not "take a different branch",
+so cached and uncached decoding cannot drift apart -- they run the same
+arithmetic over the same numbers in the same order.
+
+The bug this is really testing for is the rotary position. Attention must rotate
+by the absolute position in the conversation, not the offset within the current
+call. Using the offset works perfectly on the first pass and silently corrupts
+every one after it, and it is invisible to any check that only looks at prefill.
+
+**Grouped-query attention gets its own gate.** Qwen2.5-0.5B has 14 query heads
+and 2 key/value heads, so seven query heads share each. The definition
+materialises 14 key/value heads by repeating each one seven times and runs
+ordinary multi-head attention; `src/core/attention.js` skips the copy and
+indexes instead. `test/attention.test.js` runs both and requires exact equality,
+across prefill, cache-decode, mixed shapes, no grouping at all, and every head
+sharing one. The grouping is blocked (heads 0-6 read kv head 0), and the
+interleaved alternative -- `h % numKVHeads`, which looks just as natural --
+is checked to be a genuinely different mapping so the test is not vacuous.
+
+Attention is also checked for the properties a masking bug breaks: perturbing
+the last position must leave every earlier output untouched, the first position
+returns its own value verbatim, and every output lies inside the range of the
+values it can see.
+
+**What it buys**, generating 6 tokens from the same prompt:
+
+| | tokens/s | time |
+|---|---|---|
+| with cache | 0.17 | 36.2s |
+| without | 0.05 | 129.7s |
+
+Same tokens either way, 3.6x faster, and the gap widens with length since the
+uncached path is quadratic. A 2048-position cache costs 50 MB.
+
+These are still terrible numbers in absolute terms. Everything is scalar
+JavaScript on one core, and the GPU backend is phase 3.
+
+### Weights in memory, or streamed
+
+Streaming every weight from disk per pass moves about 1.5 GB, and with under
+2 GB free the page cache cannot absorb it, so decoding becomes disk-bound
+rather than compute-bound. `Weights` therefore takes a `resident` option that
+holds all 24 layers in memory as bfloat16 -- 716 MB, widened into reusable
+buffers on demand at about 700 ms for the whole model.
+
+Streaming stays the default, because the point of it is that the engine runs
+at all on a machine that cannot hold the model. `validate/phase2.js --stream`
+runs it that way.
+
+### A measurement bug worth recording
+
+An early run of the phase 2 gate reported one 3-pass comparison as taking
+52894.1 seconds -- 14.7 hours, in a run that finished in minutes. The cause was
+`Date.now()`, which is wall-clock and jumps when the system clock is corrected.
+All timings now use `performance.now()`, which is monotonic; the same comparison
+then measured 21.6 seconds. A benchmark must never measure itself with a clock
+that can move.
 
 ## Phase 1: the forward pass agrees with ONNX Runtime
 
@@ -172,7 +250,7 @@ would have been. It is already confirmed working end to end: a greedy decode of
 
 ```
 src/core/     backend-agnostic: dtypes, safetensors, config, tokenizer
-src/cpu/      the reference forward pass, f32 storage and f64 sums
+src/cpu/      the reference forward pass and KV cache
 src/gpu/      WebGPU compute backend                        (phase 3)
 oracle/       independent implementations, used only to generate golden files
 golden/       committed outputs of the oracle scripts
@@ -192,9 +270,10 @@ python oracle/tensor_digest.py     # regenerate golden/tensor_digest.json
 python oracle/make_corpus.py       # regenerate test/corpus.json
 python oracle/tokenize_corpus.py   # regenerate golden/tokenizer_cases.json
 python oracle/dump_reference.py    # golden/reference/, needs the ~2 GB ONNX model
-node --test                        # 61 tests
+node --test                        # 82 tests
 node validate/phase0.js            # loader and tokenizer gate
 node validate/phase1.js            # forward-pass gate against ONNX Runtime
+node validate/phase2.js            # KV cache gate, bit-exact
 node validate/generate.js "The capital of France is" 8
 node validate/layer-profile.js 3   # where the disagreement grows
 node validate/activation-scale.js  # which channels are outliers

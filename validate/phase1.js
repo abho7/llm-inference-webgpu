@@ -13,6 +13,10 @@
 //
 //   node validate/phase1.js [caseIndex...]
 
+// Durations use performance.now(), which is monotonic. Date.now() is wall
+// clock: it jumps when the system clock is corrected, and a run of this script
+// once reported a 3-pass comparison as taking 14.7 hours because of exactly
+// that. A benchmark must never measure itself with a clock that can move.
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -86,9 +90,9 @@ let argmaxAgreements = 0;
 
 for (const entry of cases) {
   const golden = readCase(entry);
-  const started = Date.now();
+  const started = performance.now();
   const out = await model.forward(entry.input_ids, { collectPresent: true });
-  const seconds = (Date.now() - started) / 1000;
+  const seconds = (performance.now() - started) / 1000;
 
   // Per layer.
   let layerWorst = { maxAbs: 0, layer: -1, kind: '' };

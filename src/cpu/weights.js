@@ -11,6 +11,8 @@
 // embedding matrix, which is 544 MB as f32, so it is never widened at all: the
 // logit computation streams it in row blocks straight from bfloat16.
 
+import { bf16ToF32Array } from '../core/dtype.js';
+
 const LAYER_TENSORS = [
   'input_layernorm.weight',
   'self_attn.q_proj.weight', 'self_attn.q_proj.bias',
@@ -38,12 +40,50 @@ export class Weights {
   #config;
   #layerCache = new Map();   // layer index -> widened tensors
   #cacheLimit;
+  #resident = null;          // layer index -> raw bfloat16 per tensor
+  #scratch = null;           // reused f32 buffers, one set for all layers
 
-  constructor(safetensors, config, { cacheLayers = 1 } = {}) {
+  /**
+   * `resident: true` holds every layer's weights in memory as bfloat16 and
+   * widens them into reusable buffers on demand.
+   *
+   * The trade is 716 MB of residency against not touching the disk. Streaming
+   * moves about 1.5 GB per forward pass, and with little free memory the page
+   * cache cannot absorb that, so decoding becomes disk-bound. Widening from RAM
+   * is a shift over 15M elements per layer, which is far cheaper than a read.
+   *
+   * It stays opt-in because 716 MB is not obviously affordable here, and the
+   * point of the streaming default is that the engine runs at all on a machine
+   * that cannot hold the model.
+   */
+  constructor(safetensors, config, { cacheLayers = 1, resident = false } = {}) {
     this.#st = safetensors;
     this.#config = config;
     this.#cacheLimit = Math.max(1, cacheLayers);
+    this.wantResident = resident;
     this.bytesRead = 0;
+  }
+
+  /** Pull every layer's weights into memory as bfloat16. Returns bytes held. */
+  async makeResident() {
+    if (this.#resident) return this.residentBytes;
+    this.#resident = new Map();
+    let held = 0;
+    for (let layer = 0; layer < this.#config.numLayers; layer++) {
+      const prefix = `model.layers.${layer}.`;
+      const raw = {};
+      for (const name of LAYER_TENSORS) {
+        const bytes = await this.#st.readRaw(prefix + name);
+        const aligned = bytes.byteOffset % 2 === 0 ? bytes : new Uint8Array(bytes);
+        raw[SHORT[name]] = new Uint16Array(
+          aligned.buffer, aligned.byteOffset, bytes.byteLength / 2,
+        );
+        held += bytes.byteLength;
+      }
+      this.#resident.set(layer, raw);
+    }
+    this.residentBytes = held;
+    return held;
   }
 
   /** The final RMSNorm gain, small enough to keep resident. */
@@ -54,6 +94,25 @@ export class Weights {
 
   /** One layer's weights, widened to f32. */
   async layer(index) {
+    if (this.wantResident && !this.#resident) await this.makeResident();
+
+    if (this.#resident) {
+      // Widen into buffers shared by every layer. Safe because a layer's
+      // weights are only live until the next layer is asked for, which is
+      // exactly how the forward pass walks them.
+      const raw = this.#resident.get(index);
+      if (!this.#scratch) {
+        this.#scratch = {};
+        for (const key of Object.keys(raw)) {
+          this.#scratch[key] = new Float32Array(raw[key].length);
+        }
+      }
+      for (const key of Object.keys(raw)) {
+        bf16ToF32Array(raw[key], this.#scratch[key]);
+      }
+      return this.#scratch;
+    }
+
     const cached = this.#layerCache.get(index);
     if (cached) return cached;
 
