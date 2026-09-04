@@ -12,6 +12,7 @@
 // logit computation streams it in row blocks straight from bfloat16.
 
 import { bf16ToF32Array } from '../core/dtype.js';
+import { roundTrip } from '../core/quantize.js';
 
 const LAYER_TENSORS = [
   'input_layernorm.weight',
@@ -35,6 +36,11 @@ const SHORT = {
   'mlp.down_proj.weight': 'wDown',
 };
 
+/** The inverse of SHORT, so a scratch buffer can be traced back to its tensor. */
+const SHORT_TO_NAME = Object.fromEntries(
+  Object.entries(SHORT).map(([name, short]) => [short, name]),
+);
+
 export class Weights {
   #st;
   #config;
@@ -56,12 +62,40 @@ export class Weights {
    * point of the streaming default is that the engine runs at all on a machine
    * that cannot hold the model.
    */
-  constructor(safetensors, config, { cacheLayers = 1, resident = false } = {}) {
+  /**
+   * `quantize` runs each 2D weight matrix through a quantization scheme and
+   * back before it is used, so the reference implementation can be evaluated
+   * under int8 or int4 without integer kernels. Norms and biases are left
+   * alone, which is what weight-only quantization means in practice.
+   *
+   * This re-quantizes on every forward pass rather than once, which makes a
+   * quantized run several times slower than an unquantized one -- int8 took
+   * 808 seconds against f16's 150 on the same passage. Caching the result would
+   * need either 1.5 GB of f32, which this machine does not have, or a second
+   * lossy step to store it more compactly, which would contaminate the very
+   * measurement the option exists to make. Slow and exact wins.
+   */
+  constructor(safetensors, config, {
+    cacheLayers = 1, resident = false, quantize = null,
+  } = {}) {
     this.#st = safetensors;
     this.#config = config;
     this.#cacheLimit = Math.max(1, cacheLayers);
     this.wantResident = resident;
+    this.quantize = quantize;
     this.bytesRead = 0;
+  }
+
+  /** Apply the configured scheme to one named tensor, in place where possible. */
+  #applyQuantization(values, name) {
+    if (!this.quantize) return values;
+    const shape = this.#st.info(name).shape;
+    if (shape.length !== 2) return values;
+    const [rows, cols] = shape;
+    if (this.quantize.groupSize && cols % this.quantize.groupSize !== 0) return values;
+    const back = roundTrip(values, rows, cols, this.quantize.scheme, this.quantize.groupSize);
+    values.set(back);
+    return values;
   }
 
   /** Pull every layer's weights into memory as bfloat16. Returns bytes held. */
@@ -109,6 +143,12 @@ export class Weights {
       }
       for (const key of Object.keys(raw)) {
         bf16ToF32Array(raw[key], this.#scratch[key]);
+      }
+      if (this.quantize) {
+        const prefix = `model.layers.${index}.`;
+        for (const [key, suffix] of Object.entries(SHORT_TO_NAME)) {
+          if (this.#scratch[key]) this.#applyQuantization(this.#scratch[key], prefix + suffix);
+        }
       }
       return this.#scratch;
     }

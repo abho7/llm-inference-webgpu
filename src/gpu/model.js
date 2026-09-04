@@ -31,6 +31,7 @@ import { MATVEC, RMSNORM, ROPE, ATTENTION, SWIGLU, ADD, GROUP } from './kernels.
 import { grid2d } from './device.js';
 import { ropeTables } from '../core/ops.js';
 import { bf16ToF32Array, f32ToF16Array } from '../core/dtype.js';
+import { roundTrip } from '../core/quantize.js';
 
 const LAYER_TENSORS = {
   inputNorm: 'input_layernorm.weight',
@@ -91,13 +92,30 @@ export class GpuModel {
    * and holding the whole model in both formats at once would need about
    * 1.5 GB of browser heap on a machine that does not have it.
    */
-  static async load(ctx, safetensors, config, { maxPositions = 2048, onProgress } = {}) {
+  static async load(ctx, safetensors, config, {
+    maxPositions = 2048, onProgress, quantize = null,
+  } = {}) {
+    // `quantize` runs the weights through a quantization scheme and back before
+    // they are uploaded. The kernels still read f16, so this measures what
+    // quantization does to the model's answers without needing integer
+    // kernels -- and since f16 storage is nearly exact for these bfloat16
+    // weights (validate/f16-fidelity.js), the difference it measures really is
+    // the quantization and not the container.
+    const applyQuantization = (wide, name) => {
+      if (!quantize) return wide;
+      const shape = safetensors.info(name).shape;
+      if (shape.length !== 2) return wide;   // norms and biases stay as they are
+      const [rows, cols] = shape;
+      if (quantize.groupSize && cols % quantize.groupSize !== 0) return wide;
+      return roundTrip(wide, rows, cols, quantize.scheme, quantize.groupSize);
+    };
+
     const upload = async (name, label) => {
       const info = safetensors.info(name);
       const raw = await safetensors.readRaw(name);
       const aligned = raw.byteOffset % 2 === 0 ? raw : new Uint8Array(raw);
       const bits = new Uint16Array(aligned.buffer, aligned.byteOffset, info.numel);
-      const wide = bf16ToF32Array(bits);
+      const wide = applyQuantization(bf16ToF32Array(bits), name);
       const half = f32ToF16Array(wide);
       return ctx.upload(half, label);
     };

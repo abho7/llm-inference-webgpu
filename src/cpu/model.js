@@ -56,6 +56,7 @@ export class ReferenceModel {
     cache = null,
     collectPresent = false,
     logitsForAllPositions = false,
+    captureNorms = false,
   } = {}) {
     const cfg = this.config;
     const seq = tokenIds.length;
@@ -70,6 +71,10 @@ export class ReferenceModel {
 
     const x = await this.#embed(tokenIds);
     const present = collectPresent ? [] : null;
+    // The normalised vectors that feed each projection. Quantization analysis
+    // needs them: weight error reaches the output as sum_c dW[r,c] * x[c], so
+    // which channels x is large in decides which weight errors matter.
+    const norms = captureNorms ? [] : null;
 
     const normed = new Float32Array(d);
     const q = new Float32Array(seq * d);
@@ -84,9 +89,13 @@ export class ReferenceModel {
     for (let layer = 0; layer < cfg.numLayers; layer++) {
       const w = await this.weights.layer(layer);
 
+      const attnNorms = captureNorms ? new Float32Array(seq * d) : null;
+      const mlpNorms = captureNorms ? new Float32Array(seq * d) : null;
+
       // ---- projections for the new tokens ----
       for (let t = 0; t < seq; t++) {
         rmsNorm(x.subarray(t * d, (t + 1) * d), w.inputNorm, cfg.rmsNormEps, normed);
+        if (captureNorms) attnNorms.set(normed, t * d);
         matVec(w.wq, normed, d, d, w.bq, q.subarray(t * d, (t + 1) * d));
         matVec(w.wk, normed, kvDim, d, w.bk, k.subarray(t * kvDim, (t + 1) * kvDim));
         matVec(w.wv, normed, kvDim, d, w.bv, v.subarray(t * kvDim, (t + 1) * kvDim));
@@ -122,12 +131,15 @@ export class ReferenceModel {
       for (let t = 0; t < seq; t++) {
         const row = x.subarray(t * d, (t + 1) * d);
         rmsNorm(row, w.postAttnNorm, cfg.rmsNormEps, normed);
+        if (captureNorms) mlpNorms.set(normed, t * d);
         matVec(w.wGate, normed, cfg.intermediateSize, d, null, gate);
         matVec(w.wUp, normed, cfg.intermediateSize, d, null, up);
         swigluInPlace(gate, up);
         matVec(w.wDown, gate, d, cfg.intermediateSize, null, projected);
         for (let i = 0; i < d; i++) row[i] += projected[i];
       }
+
+      if (captureNorms) norms.push({ attn: attnNorms, mlp: mlpNorms });
     }
 
     // Only now are the new positions visible, once every layer has written them.
@@ -147,6 +159,7 @@ export class ReferenceModel {
     return {
       logits: logitsForAllPositions ? logits : logits[0],
       present,
+      norms,
       hidden: x,
       cache: kv,
     };
