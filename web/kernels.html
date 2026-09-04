@@ -1,0 +1,307 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Kernel comparison</title>
+<style>
+  body { font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+         margin: 2rem; max-width: 72rem; color: #111; }
+  h1 { font-size: 1.15rem; margin-bottom: 0.2rem; }
+  p.lede { color: #444; max-width: 46rem; }
+  table { border-collapse: collapse; margin: 1rem 0; font-size: 12px; }
+  th, td { padding: 0.3rem 1rem 0.3rem 0; text-align: left; vertical-align: top;
+           border-bottom: 1px solid #eee; }
+  th { color: #666; font-weight: normal; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .pass { color: #070; } .fail { color: #b00; font-weight: bold; }
+  code { background: #f4f4f4; padding: 0 0.2rem; }
+</style>
+<h1>Kernel comparison: WebGPU against the CPU reference</h1>
+<p class="lede">Each kernel is run on the GPU and by the corresponding function in
+<code>src/core/ops.js</code>, on the same inputs, in this tab. Two comparisons per kernel:
+against a CPU run using the <em>same f16-rounded weights</em>, which isolates whether the
+kernel is correct, and against the full-precision CPU run, which shows what storing weights
+in f16 actually costs.</p>
+<div id="out">running...</div>
+
+<script type="module">
+import { GpuContext, grid2d } from '../src/gpu/device.js';
+import { MATVEC, RMSNORM, ROPE, ATTENTION, SWIGLU, ADD, GROUP } from '../src/gpu/kernels.js';
+import { rmsNorm, matVec, swigluInPlace, ropeFrequencies, ropeInPlace, ropeTables } from '../src/core/ops.js';
+import { groupedAttention } from '../src/core/attention.js';
+import { f32ToF16Array, f16ToF32Array } from '../src/core/dtype.js';
+
+const out = document.getElementById('out');
+const results = [];
+// Exposed immediately so a partially-finished run is still readable.
+window.__results = results;
+
+/** Deterministic pseudo-random data, so a failure can be reproduced. */
+function rand(n, seed) {
+  let s = seed >>> 0;
+  const a = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    a[i] = (s / 0xffffffff) * 2 - 1;
+  }
+  return a;
+}
+
+/** Round a f32 array through f16, exactly as uploading it to the GPU will. */
+function throughF16(a) {
+  return f16ToF32Array(f32ToF16Array(a));
+}
+
+function compare(mine, theirs) {
+  let maxAbs = 0;
+  let scale = 0;
+  let at = -1;
+  for (let i = 0; i < theirs.length; i++) {
+    const d = Math.abs(mine[i] - theirs[i]);
+    if (d > maxAbs) { maxAbs = d; at = i; }
+    if (Math.abs(theirs[i]) > scale) scale = Math.abs(theirs[i]);
+  }
+  return { maxAbs, scale, at, rel: scale > 0 ? maxAbs / scale : 0 };
+}
+
+/** Build a uniform buffer from a mixed list of ['u32'|'f32', value] pairs. */
+function packUniform(ctx, fields, label) {
+  const size = Math.max(16, Math.ceil(fields.length / 4) * 16);
+  const buf = new ArrayBuffer(size);
+  const view = new DataView(buf);
+  fields.forEach(([kind, value], i) => {
+    if (kind === 'u32') view.setUint32(i * 4, value, true);
+    else view.setFloat32(i * 4, value, true);
+  });
+  return ctx.uniform(new Uint32Array(buf), label);
+}
+
+function record(name, note, tolerance, kernelStat, f16Stat) {
+  const ok = kernelStat.rel <= tolerance;
+  results.push({ name, note, tolerance, ok,
+    kernelRel: kernelStat.rel, kernelAbs: kernelStat.maxAbs,
+    f16Rel: f16Stat ? f16Stat.rel : null, f16Abs: f16Stat ? f16Stat.maxAbs : null });
+  render();
+}
+
+function render() {
+  const rows = results.map((r) => `
+    <tr>
+      <td>${r.name}</td>
+      <td>${r.note}</td>
+      <td class="num">${r.kernelRel.toExponential(2)}</td>
+      <td class="num">${r.tolerance.toExponential(0)}</td>
+      <td class="num">${r.f16Rel === null ? '&mdash;' : r.f16Rel.toExponential(2)}</td>
+      <td class="${r.ok ? 'pass' : 'fail'}">${r.ok ? 'pass' : 'FAIL'}</td>
+    </tr>`).join('');
+  out.innerHTML = `<table>
+    <tr><th>kernel</th><th>shape</th><th>vs same-f16 CPU</th><th>bound</th>
+        <th>vs f32 CPU</th><th></th></tr>${rows}</table>` + (window.__done
+      ? `<p class="${results.every((r) => r.ok) ? 'pass' : 'fail'}">
+          ${results.every((r) => r.ok)
+            ? 'PASS: every kernel agrees with the CPU reference within tolerance'
+            : 'FAIL'}</p>`
+      : '<p>running...</p>');
+}
+
+try {
+  const ctx = await GpuContext.create();
+  window.__device = ctx.describe();
+
+  // ---------------------------------------------------------------- matvec --
+  {
+    const rows = 896;
+    const cols = 896;
+    const W = rand(rows * cols, 1);
+    const x = rand(cols, 2);
+    const bias = rand(rows, 3);
+
+    const Wf16 = f32ToF16Array(W);
+    const gpuW = ctx.upload(Wf16, 'W');
+    const gpuX = ctx.upload(x, 'x');
+    const gpuB = ctx.upload(bias, 'bias');
+    const gpuY = ctx.empty(rows * 4, 'y');
+    const { grid, width } = grid2d(rows);
+    const params = packUniform(ctx, [['u32', rows], ['u32', cols], ['u32', 1], ['u32', width]]);
+
+    ctx.dispatch(MATVEC, [gpuW, gpuX, gpuB, gpuY, params], grid, 'matvec');
+    await ctx.done();
+    const got = await ctx.readF32(gpuY, rows);
+
+    const cpuF16 = matVec(throughF16(W), x, rows, cols, bias);
+    const cpuF32 = matVec(W, x, rows, cols, bias);
+    record('matvec', `${rows}x${cols} + bias`, 1e-5, compare(got, cpuF16), compare(got, cpuF32));
+  }
+
+  // ------------------------------------------------- matvec, tall (lm_head) --
+  {
+    // The point of this case is the row count, not the arithmetic: 151936 rows
+    // exceeds maxComputeWorkgroupsPerDimension (65535), so it proves the
+    // two-dimensional dispatch reaches every row. The columns are kept narrow
+    // because the CPU side of the comparison would otherwise allocate the
+    // matrix three times over -- once as f32, once through f16 -- and a
+    // 136M-element matrix does not survive that in a browser tab.
+    const rows = 151936;
+    const cols = 32;
+    const W = rand(rows * cols, 7);
+    const x = rand(cols, 8);
+
+    const gpuW = ctx.upload(f32ToF16Array(W), 'lmW');
+    const gpuX = ctx.upload(x, 'lmX');
+    const gpuB = ctx.empty(4, 'noBias');
+    const gpuY = ctx.empty(rows * 4, 'lmY');
+    const { grid, width } = grid2d(rows);
+    const params = packUniform(ctx, [['u32', rows], ['u32', cols], ['u32', 0], ['u32', width]]);
+
+    ctx.dispatch(MATVEC, [gpuW, gpuX, gpuB, gpuY, params], grid, 'matvec-tall');
+    await ctx.done();
+    const got = await ctx.readF32(gpuY, rows);
+
+    const cpuF16 = matVec(throughF16(W), x, rows, cols, null);
+    const cpuF32 = matVec(W, x, rows, cols, null);
+    record('matvec', `${rows}x${cols}, 2D dispatch`, 1e-5,
+      compare(got, cpuF16), compare(got, cpuF32));
+  }
+
+  // --------------------------------------------------------------- rmsnorm --
+  {
+    const rows = 5;
+    const cols = 896;
+    const x = rand(rows * cols, 11);
+    const gain = rand(cols, 12);
+    const eps = 1e-6;
+
+    const gpuX = ctx.upload(x, 'x');
+    const gpuG = ctx.upload(f32ToF16Array(gain), 'gain');
+    const gpuY = ctx.empty(rows * cols * 4, 'y');
+    const params = packUniform(ctx, [['u32', rows], ['u32', cols], ['f32', eps], ['u32', 0]]);
+
+    ctx.dispatch(RMSNORM, [gpuX, gpuG, gpuY, params], [rows], 'rmsnorm');
+    await ctx.done();
+    const got = await ctx.readF32(gpuY, rows * cols);
+
+    const gainF16 = throughF16(gain);
+    const cpuF16 = new Float32Array(rows * cols);
+    const cpuF32 = new Float32Array(rows * cols);
+    for (let r = 0; r < rows; r++) {
+      rmsNorm(x.subarray(r * cols, (r + 1) * cols), gainF16, eps, cpuF16.subarray(r * cols, (r + 1) * cols));
+      rmsNorm(x.subarray(r * cols, (r + 1) * cols), gain, eps, cpuF32.subarray(r * cols, (r + 1) * cols));
+    }
+    record('rmsnorm', `${rows}x${cols}`, 1e-5, compare(got, cpuF16), compare(got, cpuF32));
+  }
+
+  // ------------------------------------------------------------------ rope --
+  {
+    const rows = 6;
+    const heads = 14;
+    const headDim = 64;
+    const theta = 1e6;
+    const basePos = 3;   // decoding from a cache, not from position zero
+
+    const v = rand(rows * heads * headDim, 21);
+    const tables = ropeTables(headDim, theta, basePos + rows);
+
+    const gpuV = ctx.upload(v, 'v');
+    const gpuCos = ctx.upload(tables.cos, 'cos');
+    const gpuSin = ctx.upload(tables.sin, 'sin');
+    const params = packUniform(ctx, [
+      ['u32', rows], ['u32', heads], ['u32', headDim], ['u32', basePos],
+    ]);
+    const pairs = rows * heads * (headDim / 2);
+    ctx.dispatch(ROPE, [gpuV, gpuCos, gpuSin, params], [Math.ceil(pairs / 64)], 'rope');
+    await ctx.done();
+    const got = await ctx.readF32(gpuV, v.length);
+
+    const cpu = Float32Array.from(v);
+    const invFreq = ropeFrequencies(headDim, theta);
+    for (let r = 0; r < rows; r++) {
+      for (let h = 0; h < heads; h++) {
+        ropeInPlace(cpu, r * heads * headDim + h * headDim, headDim, basePos + r, invFreq);
+      }
+    }
+    // The angles now come from an f64-computed table rather than the GPU's own
+    // sin and cos, so the only remaining difference is that the table itself is
+    // stored in f32.
+    record('rope', `${rows}x${heads}x${headDim}, base ${basePos}, table`, 1e-5,
+      compare(got, cpu), null);
+  }
+
+  // ------------------------------------------------------------- attention --
+  {
+    const seq = 3;
+    const past = 5;
+    const numHeads = 14;
+    const numKVHeads = 2;
+    const headDim = 64;
+    const total = past + seq;
+    const groupSize = numHeads / numKVHeads;
+
+    const q = rand(seq * numHeads * headDim, 31);
+    const keys = rand(total * numKVHeads * headDim, 32);
+    const values = rand(total * numKVHeads * headDim, 33);
+
+    const gpuQ = ctx.upload(q, 'q');
+    const gpuK = ctx.upload(keys, 'k');
+    const gpuV = ctx.upload(values, 'v');
+    const gpuOut = ctx.empty(seq * numHeads * headDim * 4, 'attnOut');
+    const gpuScores = ctx.empty(numHeads * seq * total * 4, 'scores');
+    const params = packUniform(ctx, [
+      ['u32', seq], ['u32', past], ['u32', numHeads], ['u32', numKVHeads],
+      ['u32', headDim], ['u32', groupSize], ['u32', total], ['u32', 0],
+    ]);
+
+    ctx.dispatch(ATTENTION, [gpuQ, gpuK, gpuV, gpuOut, gpuScores, params],
+      [seq, numHeads], 'attention');
+    await ctx.done();
+    const got = await ctx.readF32(gpuOut, seq * numHeads * headDim);
+
+    const cpu = new Float32Array(seq * numHeads * headDim);
+    groupedAttention(q, keys, values, cpu, new Float32Array(total),
+      { seq, past, numHeads, numKVHeads, headDim });
+    record('attention', `seq ${seq}, past ${past}, ${numHeads}/${numKVHeads} heads`, 1e-5,
+      compare(got, cpu), null);
+  }
+
+  // ---------------------------------------------------------------- swiglu --
+  {
+    const n = 4864;
+    const gate = rand(n, 41);
+    const up = rand(n, 42);
+    const gpuGate = ctx.upload(gate, 'gate');
+    const gpuUp = ctx.upload(up, 'up');
+    const params = packUniform(ctx, [['u32', n], ['u32', 0], ['u32', 0], ['u32', 0]]);
+    ctx.dispatch(SWIGLU, [gpuGate, gpuUp, params], [Math.ceil(n / GROUP)], 'swiglu');
+    await ctx.done();
+    const got = await ctx.readF32(gpuGate, n);
+
+    const cpu = swigluInPlace(Float32Array.from(gate), up);
+    record('swiglu', `${n} elements`, 1e-5, compare(got, cpu), null);
+  }
+
+  // ------------------------------------------------------------------- add --
+  {
+    const n = 896 * 5;
+    const x = rand(n, 51);
+    const delta = rand(n, 52);
+    const gpuX = ctx.upload(x, 'x');
+    const gpuD = ctx.upload(delta, 'delta');
+    const params = packUniform(ctx, [['u32', n], ['u32', 0], ['u32', 0], ['u32', 0]]);
+    ctx.dispatch(ADD, [gpuX, gpuD, params], [Math.ceil(n / GROUP)], 'add');
+    await ctx.done();
+    const got = await ctx.readF32(gpuX, n);
+
+    const cpu = new Float32Array(n);
+    for (let i = 0; i < n; i++) cpu[i] = x[i] + delta[i];
+    record('add', `${n} elements`, 1e-6, compare(got, cpu), null);
+  }
+
+  window.__done = true;
+  window.__results = results;
+  window.__ok = results.every((r) => r.ok);
+  document.title = window.__ok ? 'Kernels: ok' : 'Kernels: FAILED';
+  render();
+} catch (error) {
+  window.__done = true;
+  window.__error = String(error) + '\n' + (error.stack ?? '');
+  out.innerHTML = `<p class="fail">${String(error)}</p><pre>${error.stack ?? ''}</pre>`;
+  document.title = 'Kernels: ERROR';
+}
+</script>

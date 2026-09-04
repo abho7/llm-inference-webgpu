@@ -1,0 +1,142 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Transcendental precision</title>
+<style>
+  body { font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem;
+         max-width: 64rem; }
+  table { border-collapse: collapse; margin: 1rem 0; font-size: 12px; }
+  th, td { padding: 0.3rem 1.5rem 0.3rem 0; text-align: left; border-bottom: 1px solid #eee; }
+  th { color: #666; font-weight: normal; }
+  td.num { font-variant-numeric: tabular-nums; }
+  p.lede { color: #444; max-width: 46rem; }
+</style>
+<h1 style="font-size:1.15rem">How accurate are this adapter's transcendentals?</h1>
+<p class="lede">WGSL permits relaxed precision on <code>pow</code>, <code>sin</code> and
+<code>cos</code>: an implementation may answer to a few ULP rather than correctly rounding.
+The rotary embedding is the only part of the forward pass that calls them, and its kernel
+comparison failed at 2.2e-5 against a 1e-5 bound. This measures each function separately,
+over exactly the angles the rotary embedding uses, so the failure can be attributed instead
+of guessed at.</p>
+<div id="out">running...</div>
+
+<script type="module">
+import { GpuContext } from '../src/gpu/device.js';
+
+const out = document.getElementById('out');
+const SHADER = `
+struct Params { n: u32, which: u32, theta: f32, headDim: u32 };
+@group(0) @binding(0) var<storage, read>       arg    : array<f32>;
+@group(0) @binding(1) var<storage, read_write> res    : array<f32>;
+@group(0) @binding(2) var<uniform>             params : Params;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= params.n) { return; }
+  let a = arg[i];
+  if (params.which == 0u) {
+    res[i] = cos(a);
+  } else if (params.which == 1u) {
+    res[i] = sin(a);
+  } else {
+    // pow(theta, -2j/headDim), the rotary frequency, with a carrying j.
+    res[i] = pow(params.theta, -2.0 * a / f32(params.headDim));
+  }
+}`;
+
+function packUniform(ctx, fields) {
+  const buf = new ArrayBuffer(16);
+  const view = new DataView(buf);
+  fields.forEach(([kind, v], i) => {
+    if (kind === 'u32') view.setUint32(i * 4, v, true); else view.setFloat32(i * 4, v, true);
+  });
+  return ctx.uniform(new Uint32Array(buf));
+}
+
+async function measure(ctx, which, args, exact, theta = 1e6, headDim = 64) {
+  const gpuArg = ctx.upload(args, 'arg');
+  const gpuRes = ctx.empty(args.length * 4, 'res');
+  const params = packUniform(ctx, [
+    ['u32', args.length], ['u32', which], ['f32', theta], ['u32', headDim],
+  ]);
+  ctx.dispatch(SHADER, [gpuArg, gpuRes, params], [Math.ceil(args.length / 64)], 'transcendental');
+  await ctx.done();
+  const got = await ctx.readF32(gpuRes, args.length);
+
+  let maxAbs = 0;
+  let maxRel = 0;
+  let maxUlp = 0;
+  for (let i = 0; i < args.length; i++) {
+    const want = exact[i];
+    const diff = Math.abs(got[i] - want);
+    if (diff > maxAbs) maxAbs = diff;
+    if (want !== 0 && diff / Math.abs(want) > maxRel) maxRel = diff / Math.abs(want);
+    // ULP measured against f32, which is the precision the GPU actually has.
+    const f32want = Math.fround(want);
+    const ulp = Math.abs(f32want) > 0
+      ? diff / (Math.abs(f32want) * 2 ** -23)
+      : 0;
+    if (ulp > maxUlp) maxUlp = ulp;
+  }
+  return { maxAbs, maxRel, maxUlp };
+}
+
+try {
+  const ctx = await GpuContext.create();
+
+  // The angles the rotary embedding actually evaluates: position * theta^(-2j/d)
+  // for positions up to a realistic context and every frequency index.
+  const headDim = 64;
+  const theta = 1e6;
+  const positions = [];
+  for (let p = 0; p < 2048; p += 7) positions.push(p);
+  const angles = [];
+  for (const p of positions) {
+    for (let j = 0; j < headDim / 2; j++) angles.push(p * Math.pow(theta, (-2 * j) / headDim));
+  }
+  const angleArr = Float32Array.from(angles);
+
+  const cosExact = angles.map(Math.cos);
+  const sinExact = angles.map(Math.sin);
+
+  const js = Float32Array.from({ length: headDim / 2 }, (_, j) => j);
+  const powExact = Array.from(js, (j) => Math.pow(theta, (-2 * j) / headDim));
+
+  // The same functions restricted to one turn. If the large-angle error is
+  // argument reduction rather than the transcendental itself, these will be
+  // sharply better -- and the distinction decides whether the fix is to avoid
+  // the GPU's sin/cos or merely to avoid handing them large arguments.
+  const small = Float32Array.from({ length: 4096 }, (_, i) => (i / 4096) * 2 * Math.PI);
+  const smallCos = Array.from(small, Math.cos);
+  const smallSin = Array.from(small, Math.sin);
+
+  const rows = [
+    ['cos(angle), angles up to ~2047', await measure(ctx, 0, angleArr, cosExact), angles.length],
+    ['sin(angle), angles up to ~2047', await measure(ctx, 1, angleArr, sinExact), angles.length],
+    ['cos(angle), angles within [0, 2pi)', await measure(ctx, 0, small, smallCos), small.length],
+    ['sin(angle), angles within [0, 2pi)', await measure(ctx, 1, small, smallSin), small.length],
+    ['pow(1e6, -2j/64)', await measure(ctx, 2, js, powExact, theta, headDim), js.length],
+  ];
+
+  window.__precision = Object.fromEntries(rows.map(([n, s]) => [n, s]));
+  window.__done = true;
+
+  out.innerHTML = `<table>
+    <tr><th>function</th><th>samples</th><th>max abs error</th><th>max rel error</th>
+        <th>max error in f32 ULP</th></tr>
+    ${rows.map(([name, s, n]) => `<tr>
+      <td>${name}</td><td class="num">${n.toLocaleString()}</td>
+      <td class="num">${s.maxAbs.toExponential(2)}</td>
+      <td class="num">${s.maxRel.toExponential(2)}</td>
+      <td class="num">${s.maxUlp.toFixed(1)}</td></tr>`).join('')}
+  </table>
+  <p class="lede">A correctly-rounded f32 function would be at most 0.5 ULP. Anything
+  materially above that is the relaxed-precision allowance being used, and it puts a floor
+  under how closely any kernel calling these can match an f64 reference.</p>`;
+  document.title = 'Transcendental precision: done';
+} catch (error) {
+  window.__done = true;
+  window.__error = String(error);
+  out.innerHTML = `<p style="color:#b00">${String(error)}</p>`;
+}
+</script>

@@ -9,11 +9,12 @@ No PyTorch, no `transformers`, no tokenizer library. The safetensors container,
 the bfloat16 conversion, the BPE tokenizer, the attention kernels and the
 quantization are all in this repository.
 
-> **Status: Phase 2 of 6.** The model runs, caches its keys and values, and
-> generates text that matches an independent implementation token for token. It
-> is still slow: there is no GPU backend yet, so everything below runs in scalar
-> JavaScript. The table marks what is actually done, and nothing is claimed
-> before it is measured.
+> **Status: Phase 3 of 6, in progress.** The model runs, caches its keys and
+> values, and generates text that matches an independent implementation token
+> for token. The WebGPU kernels are written and every one of them agrees with
+> the CPU reference; wiring them into a full GPU forward pass is the next step.
+> The table marks what is actually done, and nothing is claimed before it is
+> measured.
 
 ## What this sets out to prove
 
@@ -29,6 +30,84 @@ already do that. The claims worth making are narrower and checkable:
 | 5 | The WebGPU backend matches the CPU reference within f16 tolerance | 3 | not started |
 | 6 | Quantization error is characterised per layer, not just end to end | 4 | not started |
 | 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | not started |
+
+## Phase 3: the WebGPU kernels
+
+Seven compute kernels in WGSL, one per operation in the forward pass, each a
+direct translation of the corresponding function in `src/core/ops.js`. No
+fusion and no tiling yet: phase 3's claim is that the GPU agrees with the CPU,
+and every optimisation added before that is established is a place for a
+discrepancy to hide.
+
+`web/kernels.html` runs each kernel on the GPU and the CPU function on the same
+inputs, in the same tab. Two comparisons per kernel, which separate two
+different questions:
+
+| kernel | shape | vs same-f16 CPU | vs full-f32 CPU |
+|---|---|---|---|
+| matvec | 896x896 + bias | 1.08e-7 | 1.44e-4 |
+| matvec | 151936x32, 2D dispatch | 9.43e-8 | 1.74e-4 |
+| rmsnorm | 5x896 | 7.13e-8 | 2.51e-4 |
+| rope | 6x14x64, from position 3 | 8.97e-8 | -- |
+| attention | seq 3, past 5, 14/2 heads | 1.64e-7 | -- |
+| swiglu | 4864 elements | 8.58e-8 | -- |
+| add | 4480 elements | 0 | -- |
+
+The middle column feeds the CPU the *same f16-rounded weights* the GPU holds,
+so it isolates whether the kernel is correct: everything lands at 1e-7, which
+is f32 accumulation order and nothing else. The right column compares against
+full-precision weights, so it prices f16 storage: about 2e-4, a thousand times
+larger. Those are two different facts and reporting one number would have
+blurred them.
+
+Precision is stated rather than inherited: weights are f16 in storage,
+activations f32, every dot product accumulated in f32. Weights are the
+bandwidth bottleneck at batch one and activations are not, and no weight in
+this model exceeds 214 against an f16 maximum of 65504, so the conversion
+cannot overflow.
+
+### The rotary embedding could not be computed on the GPU
+
+The rope kernel initially failed, at 2.2e-5 against a 1e-5 bound, while every
+other kernel passed at 1e-7. `web/precision.html` measures why rather than
+guessing:
+
+| function | max absolute error |
+|---|---|
+| `cos`, angles up to ~2047 | 5.3e-5 |
+| `sin`, angles up to ~2047 | 5.9e-5 |
+| `cos`, angles within one turn | 3.0e-5 |
+| `sin`, angles within one turn | 3.0e-5 |
+| `pow(1e6, -2j/64)` | 1.4e-8 (6.5 ULP) |
+
+WGSL permits relaxed precision on transcendentals, and this adapter uses the
+allowance. The small-angle rows are what make the diagnosis: restricting to a
+single turn barely helps, so this is the transcendental itself and not argument
+reduction, and `pow` being fine at 6.5 ULP rules out the frequency computation.
+About 3e-5 is a floor, 300 times worse than every other kernel manages.
+
+So the cosines and sines are precomputed once on the CPU in f64 and uploaded as
+a table, and the kernel does nothing but multiply and add. The rope kernel went
+from 2.2e-5 to 9.0e-8, a factor of 250. It is also less work per token than
+evaluating two transcendentals per element per layer, but that is a side
+benefit; the reason is that the GPU cannot compute this accurately enough to be
+checked.
+
+### Running the browser side
+
+```bash
+node tools/serve.js                       # serves the repo with HTTP range support
+# then open, in a WebGPU-capable browser:
+#   /web/probe.html      adapter features, limits, and a compute shader with a known answer
+#   /web/kernels.html    every kernel against the CPU reference
+#   /web/precision.html  what this adapter's transcendentals actually cost
+```
+
+Range support is not incidental: the weights are 988 MB and the page needs
+arbitrary slices, exactly as the Node loader reads them through a file
+descriptor. `src/core/source-web.js` refuses to continue if the server answers
+a range request with a 200, because silently downloading the whole model is
+worse than failing.
 
 ## Phase 2: the KV cache, checked exactly
 
@@ -251,7 +330,9 @@ would have been. It is already confirmed working end to end: a greedy decode of
 ```
 src/core/     backend-agnostic: dtypes, safetensors, config, tokenizer
 src/cpu/      the reference forward pass and KV cache
-src/gpu/      WebGPU compute backend                        (phase 3)
+src/gpu/      WebGPU device plumbing and the WGSL kernels
+web/          browser harnesses: probe, kernel comparison, precision
+tools/        a static server with range support, for the browser harnesses
 oracle/       independent implementations, used only to generate golden files
 golden/       committed outputs of the oracle scripts
 validate/     gate reports; every number recomputed on the spot
@@ -270,7 +351,7 @@ python oracle/tensor_digest.py     # regenerate golden/tensor_digest.json
 python oracle/make_corpus.py       # regenerate test/corpus.json
 python oracle/tokenize_corpus.py   # regenerate golden/tokenizer_cases.json
 python oracle/dump_reference.py    # golden/reference/, needs the ~2 GB ONNX model
-node --test                        # 82 tests
+node --test                        # 84 tests
 node validate/phase0.js            # loader and tokenizer gate
 node validate/phase1.js            # forward-pass gate against ONNX Runtime
 node validate/phase2.js            # KV cache gate, bit-exact
