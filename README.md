@@ -9,11 +9,10 @@ No PyTorch, no `transformers`, no tokenizer library. The safetensors container,
 the bfloat16 conversion, the BPE tokenizer, the attention kernels and the
 quantization are all in this repository.
 
-> **Status: Phase 3 of 6.** The whole model runs on the GPU with f16 weights
-> and picks the same next token as ONNX Runtime on every test prompt. What is
-> left is speed: the kernels are unfused and untiled on purpose, and no
-> throughput claim is made yet. The table marks what is actually done, and
-> nothing is claimed before it is measured.
+> **Status: Phase 4 of 6.** The model runs on the GPU, agrees with ONNX Runtime
+> per layer, and has been quantized to 8 and 4 bits with the damage measured
+> rather than asserted. What is left is speed: the kernels are unfused and
+> untiled on purpose, and no throughput claim is made yet.
 
 ## What this sets out to prove
 
@@ -27,8 +26,102 @@ already do that. The claims worth making are narrower and checkable:
 | 3 | Logits match ONNX Runtime to a stated tolerance, per layer | 1 | **done** |
 | 4 | Incremental decode with a KV cache equals full recomputation | 2 | **done** |
 | 5 | The WebGPU backend matches the CPU reference within f16 tolerance | 3 | **done** |
-| 6 | Quantization error is characterised per layer, not just end to end | 4 | not started |
+| 6 | Quantization error is characterised per layer, not just end to end | 4 | **done** |
 | 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | not started |
+
+## Phase 4: quantization, and a prediction that turned out wrong
+
+Two weight-only schemes, both written here: INT8 symmetric per output channel,
+and INT4 asymmetric per group of weights along the input dimension, packed two
+codes to a byte. Activations stay f32.
+
+### What it costs in weight space
+
+`validate/quantization-error.js` measures every one of the 169 weight matrices
+under every scheme. Relative Frobenius error, averaged by role:
+
+| role | f16 | int8 | int4-g128 | int4-g64 | int4-g32 |
+|---|---|---|---|---|---|
+| embed | 2.6e-8 | 9.0e-3 | 1.05e-1 | 9.4e-2 | 8.2e-2 |
+| q_proj | 1.7e-8 | 9.7e-3 | 1.10e-1 | 9.8e-2 | 8.5e-2 |
+| k_proj | 1.4e-8 | 9.8e-3 | 1.13e-1 | 9.9e-2 | 8.6e-2 |
+| v_proj | 2.4e-8 | 1.02e-2 | 1.18e-1 | 1.03e-1 | 8.8e-2 |
+| o_proj | 2.4e-8 | 1.00e-2 | 1.08e-1 | 9.3e-2 | 8.2e-2 |
+| gate_proj | 1.6e-8 | 8.9e-3 | 1.07e-1 | 9.5e-2 | 8.3e-2 |
+| up_proj | 1.9e-8 | 8.9e-3 | 1.06e-1 | 9.5e-2 | 8.3e-2 |
+| down_proj | 2.1e-8 | 1.23e-2 | 1.09e-1 | 9.6e-2 | 8.4e-2 |
+
+The v_proj matrices are consistently the hardest, and the layer-16 one is the
+worst in the model. Storage, counting the scales and zero points rather than
+quoting the nominal bit width:
+
+| scheme | bits/weight | model |
+|---|---|---|
+| f16 | 16.000 | 988 MB |
+| int8 | 8.036 | 496 MB |
+| int4-g128 | 4.500 | 278 MB |
+| int4-g32 | 6.000 | 371 MB |
+
+### What it costs in answers
+
+Weight error only matters through its effect on output. Perplexity under a
+protocol fixed before running -- same passage, same positions, full left
+context, nothing scored twice -- with a paired comparison, because every scheme
+scores identical positions and an aggregate difference of a fraction of a
+percent means nothing on its own.
+
+| weights | perplexity | mean NLL vs f16 | oracle argmax |
+|---|---|---|---|
+| f16 | 14.71 | baseline | 5/5 |
+| int8 | 14.65 | -0.0038 +- 0.0136 (0.3 SE) | 4/5 |
+| int4-g128 | 22.28 | **+0.4155 +- 0.1668 (2.5 SE)** | 3/5 |
+
+int8 came out *lower* than f16, and the paired test is what stops that becoming
+a claim: at 0.3 standard errors it is noise, and the honest statement is that
+int8 does not measurably hurt this model, not that it helps it.
+
+int4 is a different story. At 4.5 bits per weight the model loses 0.42 nats per
+token, a 2.5-standard-error effect, and it stops agreeing with the oracle on
+which token comes next for two of five prompts. A longer run in the browser
+harness, over 183 positions, found the same shape: +38.8% perplexity at g128
+and +27.0% at g32. Smaller groups help and do not rescue it. At 0.5B parameters
+there is not enough redundancy to absorb 4-bit rounding, which is consistent
+with the literature but worth having measured rather than cited.
+
+### The prediction from phase 1 was wrong
+
+Phase 1 found channel 490 growing to 27 times the RMS of the hidden state, and
+I wrote that outlier channels like it are "precisely what makes per-tensor
+quantization fail". Phase 4 says otherwise.
+
+Weight-only quantization reaches the output as `dy[r] = sum over c of
+dW[r,c] * x[c]`, so each channel's weight error is weighted by that channel's
+activation. `validate/quantization-outliers.js` measures the resulting
+per-channel damage. It is concentrated -- the worst single channel carries 1.0
+to 2.3% of the total where an even split would give 0.112%, so 9 to 20 times
+its share -- but channel 490 is almost never the culprit. Channel 570 tops the
+list in 10 of 25 cases.
+
+The reason is in the normalisation gain, and it is unambiguous:
+
+| layer | gain[490] | mean abs gain | ratio | rank of 896 |
+|---|---|---|---|---|
+| 0 | 0.5039 | 0.0695 | 7.25 | 4 |
+| 8 | 0.0486 | 1.0842 | 0.045 | **896** |
+| 15 | -0.0630 | 1.5965 | 0.039 | **896** |
+| 22 | 0.0845 | 1.5865 | 0.053 | **896** |
+| 23 | 0.4980 | 1.7206 | 0.289 | 896 |
+
+At every layer past the first, channel 490 has the *smallest* normalisation
+gain of all 896. The model makes that channel massive in the residual stream
+and then suppresses it before any projection reads it, so a projection never
+sees the outlier at all.
+
+That distinction is the real result. The massive activation lives in the
+residual stream, and weight-only quantization does not touch the residual
+stream. It would matter for quantizing *activations*, which is where the
+outlier problem in the literature actually sits. It does not matter much for
+quantizing weights, and phase 1 was too quick to assume it would.
 
 ## Phase 3: the WebGPU kernels
 
@@ -147,6 +240,7 @@ node tools/serve.js                       # serves the repo with HTTP range supp
 #   /web/kernels.html    every kernel against the CPU reference
 #   /web/precision.html  what this adapter's transcendentals actually cost
 #   /web/model.html      the whole model on the GPU, against the ONNX oracle
+#   /web/perplexity.html perplexity under each quantization scheme
 ```
 
 Range support is not incidental: the weights are 988 MB and the page needs
@@ -294,8 +388,9 @@ the projection that follows sums 896 terms in which one dominates the rest.
 That is catastrophic cancellation, and it inflates absolute error without
 anything being wrong. The error peaks exactly where the concentration does.
 
-This is not just an explanation, it is a preview: outlier channels like 490 are
-precisely what makes per-tensor quantization fail, which is phase 4's problem.
+I expected this to be a preview of phase 4 -- outlier channels being what makes
+quantization fail. Phase 4 measured it and the prediction was wrong; the
+correction is in that section.
 
 ## Phase 0: what is established, and how
 
@@ -374,7 +469,7 @@ would have been. It is already confirmed working end to end: a greedy decode of
 ## Layout
 
 ```
-src/core/     backend-agnostic: dtypes, safetensors, config, tokenizer
+src/core/     backend-agnostic: dtypes, safetensors, config, tokenizer, quantization
 src/cpu/      the reference forward pass and KV cache
 src/gpu/      WebGPU device plumbing and the WGSL kernels
 web/          browser harnesses: probe, kernel comparison, precision
@@ -397,11 +492,14 @@ python oracle/tensor_digest.py     # regenerate golden/tensor_digest.json
 python oracle/make_corpus.py       # regenerate test/corpus.json
 python oracle/tokenize_corpus.py   # regenerate golden/tokenizer_cases.json
 python oracle/dump_reference.py    # golden/reference/, needs the ~2 GB ONNX model
-node --test                        # 84 tests
+node --test                        # 101 tests
 node validate/phase0.js            # loader and tokenizer gate
 node validate/phase1.js            # forward-pass gate against ONNX Runtime
 node validate/phase2.js            # KV cache gate, bit-exact
 node validate/f16-fidelity.js     # what f16 storage costs these weights
+node validate/quantization-error.js    # per-tensor error for every scheme
+node validate/quantization-outliers.js # which channels carry the damage
+node validate/perplexity.js       # paired perplexity, f16 vs int8 vs int4
 node validate/generate.js "The capital of France is" 8
 node validate/layer-profile.js 3   # where the disagreement grows
 node validate/activation-scale.js  # which channels are outliers

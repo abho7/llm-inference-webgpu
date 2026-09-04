@@ -1,0 +1,246 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Quantization perplexity</title>
+<style>
+  body { font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem;
+         max-width: 70rem; color: #111; }
+  h1 { font-size: 1.15rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1rem; margin-top: 1.8rem; }
+  p.lede { color: #444; max-width: 46rem; }
+  table { border-collapse: collapse; margin: 1rem 0; font-size: 12px; }
+  th, td { padding: 0.3rem 1.4rem 0.3rem 0; text-align: left; border-bottom: 1px solid #eee; }
+  th { color: #666; font-weight: normal; }
+  td.num { font-variant-numeric: tabular-nums; }
+  #log { color: #666; font-size: 12px; }
+  pre.protocol { background: #f6f6f6; padding: 0.8rem 1rem; font-size: 12px;
+                 white-space: pre-wrap; max-width: 46rem; }
+</style>
+<h1>What does quantization cost, end to end?</h1>
+<p class="lede">Perplexity under each weight scheme, plus whether the model still picks the
+same next token as the fp32 ONNX Runtime oracle. Weights are quantized and dequantized on
+the way to the GPU, so the kernels are unchanged and the only variable is the weights.</p>
+
+<h2>Protocol, fixed before running</h2>
+<pre class="protocol">text        a fixed passage, held in this page, tokenized with the model's own tokenizer
+window      every token after the first is predicted from all tokens before it,
+            with no sliding window and no stride, so each prediction sees its
+            full left context and no token is scored twice
+scored      every position except the first, which has nothing to condition on
+metric      exp(mean negative log-likelihood of the actual next token), natural log
+decoding    none: this reads the model's distribution, it does not sample
+identical   the same token sequence and the same positions for every scheme</pre>
+<p class="lede">Stating this first is the point. Perplexity is easy to move by changing the
+stride, the window, or which positions get counted, so the protocol is fixed in advance and
+every scheme is scored on exactly the same positions.</p>
+
+<div id="log">starting...</div>
+<div id="out"></div>
+
+<script type="module">
+import { GpuContext } from '../src/gpu/device.js';
+import { GpuModel } from '../src/gpu/model.js';
+import { Safetensors } from '../src/core/safetensors.js';
+import { FetchSource } from '../src/core/source-web.js';
+import { ModelConfig } from '../src/core/config.js';
+import { Tokenizer } from '../src/core/tokenizer.js';
+import { bf16ToF32Array } from '../src/core/dtype.js';
+import { bitsPerWeight } from '../src/core/quantize.js';
+
+const log = document.getElementById('log');
+const out = document.getElementById('out');
+const say = (m) => { log.textContent = m; console.log('[ppl]', m); };
+
+// Held-out text. Not from the model's training corpus in any controlled sense,
+// which is a limitation and is reported as one: the absolute perplexity is not
+// comparable to published figures. The comparison between schemes is, because
+// every scheme sees exactly this.
+const TEXT = `The theory of computation asks what problems can be solved by machines, and how
+much time and memory the solutions need. A Turing machine is deliberately impoverished: a
+tape, a head that reads and writes one symbol at a time, and a finite table of rules. That
+poverty is the point. If a problem can be solved at all by any mechanical procedure, it can
+be solved by this one, so a statement about Turing machines is a statement about computation
+itself rather than about any particular computer.
+
+Complexity theory then asks a sharper question. Not whether a problem can be solved, but
+whether it can be solved quickly. The class P contains the problems a deterministic machine
+settles in polynomial time; NP contains those whose solutions can be checked in polynomial
+time once someone hands you a candidate. Whether these classes are the same is the best
+known open question in the field, and a great deal of practical cryptography quietly assumes
+the answer is no.`;
+
+const ALL_SCHEMES = [
+  { label: 'f16 (no quantization)', quantize: null, bits: 16 },
+  { label: 'int8, per channel', quantize: { scheme: 'int8' }, bits: bitsPerWeight('int8', 896) },
+  { label: 'int4, groups of 128', quantize: { scheme: 'int4', groupSize: 128 }, bits: bitsPerWeight('int4', 896, 128) },
+  { label: 'int4, groups of 32', quantize: { scheme: 'int4', groupSize: 32 }, bits: bitsPerWeight('int4', 896, 32) },
+];
+
+// ?schemes=f16,int8 runs a subset. Each scheme means re-uploading 988 MB and
+// quantizing 494M weights on the main thread, so narrowing the run is the
+// difference between a few minutes and half an hour.
+const wanted = new URLSearchParams(location.search).get('schemes');
+const SCHEMES = wanted
+  ? ALL_SCHEMES.filter((s) => wanted.split(',').some((w) => s.label.startsWith(w.trim())))
+  : ALL_SCHEMES;
+
+const rows = [];
+function render() {
+  out.innerHTML = `<table>
+    <tr><th>weights</th><th>bits/weight</th><th>model size</th><th>perplexity</th>
+        <th>vs f16</th><th>mean NLL change</th><th>oracle argmax</th></tr>
+    ${rows.map((r) => `<tr>
+      <td>${r.label}</td>
+      <td class="num">${r.bits.toFixed(3)}</td>
+      <td class="num">${r.sizeMB} MB</td>
+      <td class="num">${r.ppl.toFixed(4)}</td>
+      <td class="num">${r.delta === null ? '&mdash;' : `${r.delta > 0 ? '+' : ''}${r.delta.toFixed(2)}%`}</td>
+      <td class="num">${r.paired === null ? '&mdash;'
+        : `${r.paired.mean >= 0 ? '+' : ''}${r.paired.mean.toFixed(4)} &plusmn; ${r.paired.stderr.toFixed(4)}` +
+          ` (${Math.abs(r.paired.t) < 2 ? 'not distinguishable' : `${r.paired.t.toFixed(1)} SE`})`}</td>
+      <td class="num">${r.argmaxAgree}/${r.argmaxTotal}</td>
+    </tr>`).join('')}
+  </table>`;
+}
+
+try {
+  const base = '..';
+  const config = ModelConfig.parse(await (await fetch(`${base}/weights/config.json`)).text());
+  const tokenizer = Tokenizer.fromJSON(await (await fetch(`${base}/weights/tokenizer.json`)).text());
+  const manifest = await (await fetch(`${base}/golden/reference/manifest.json`)).json();
+
+  const st = await Safetensors.open(await FetchSource.open(`${base}/weights/model.safetensors`));
+  const ctx = await GpuContext.create();
+  const d = config.hiddenSize;
+
+  async function embed(ids) {
+    const arr = new Float32Array(ids.length * d);
+    for (let t = 0; t < ids.length; t++) {
+      const bytes = await st.readRawRange('model.embed_tokens.weight', ids[t] * d * 2, d * 2);
+      const aligned = bytes.byteOffset % 2 === 0 ? bytes : new Uint8Array(bytes);
+      arr.set(bf16ToF32Array(new Uint16Array(aligned.buffer, aligned.byteOffset, d)), t * d);
+    }
+    return arr;
+  }
+
+  const ids = tokenizer.encode(TEXT.replace(/\s+/g, ' ').trim());
+  say(`${ids.length} tokens to score`);
+  const hidden = await embed(ids);
+
+  let baseline = null;
+  let baselineTokens = null;
+  window.__rows = rows;
+
+  for (const scheme of SCHEMES) {
+    say(`${scheme.label}: uploading weights...`);
+    const t0 = performance.now();
+    const model = await GpuModel.load(ctx, st, config, {
+      maxPositions: ids.length + 8,
+      quantize: scheme.quantize,
+      onProgress: (done, total) => {
+        if (done % 30 === 0) say(`${scheme.label}: uploading ${done}/${total}`);
+      },
+    });
+    const loadSeconds = (performance.now() - t0) / 1000;
+
+    // Score the passage one token at a time through the cache. Each step
+    // predicts the next token from everything before it.
+    const cache = model.newCache(ids.length + 2);
+    // Per-token, not just the total. Every scheme scores exactly the same
+    // positions, so the schemes can be compared position by position, which is
+    // far more sensitive than comparing two aggregate numbers -- and it is the
+    // only way to tell a real difference from a small-sample wobble.
+    const perToken = new Float64Array(ids.length - 1);
+    let sumNegativeLogProb = 0;
+    let scored = 0;
+
+    for (let t = 0; t < ids.length - 1; t++) {
+      const row = hidden.subarray(t * d, (t + 1) * d);
+      const { logits } = await model.forward(row, 1, { cache, wantLogits: true });
+
+      // log softmax at the true next token, computed with the usual max shift.
+      let max = -Infinity;
+      for (let i = 0; i < logits.length; i++) if (logits[i] > max) max = logits[i];
+      let sumExp = 0;
+      for (let i = 0; i < logits.length; i++) sumExp += Math.exp(logits[i] - max);
+      const target = ids[t + 1];
+      const nll = -(logits[target] - max - Math.log(sumExp));
+      perToken[t] = nll;
+      sumNegativeLogProb += nll;
+      scored++;
+
+      if (t % 25 === 0) say(`${scheme.label}: scored ${t}/${ids.length - 1}`);
+    }
+
+    const ppl = Math.exp(sumNegativeLogProb / scored);
+
+    // And the sanity check that matters more than perplexity: does it still
+    // choose the same next token as the fp32 oracle on the phase 1 prompts?
+    let argmaxAgree = 0;
+    let argmaxTotal = 0;
+    for (const entry of manifest.cases) {
+      const promptHidden = await embed(entry.input_ids);
+      const promptCache = model.newCache(entry.seq + 2);
+      const { logits } = await model.forward(promptHidden, entry.seq,
+        { cache: promptCache, wantLogits: true });
+      let argmax = 0;
+      for (let i = 1; i < logits.length; i++) if (logits[i] > logits[argmax]) argmax = i;
+      if (argmax === entry.argmax) argmaxAgree++;
+      argmaxTotal++;
+    }
+
+    // Paired comparison against the f16 run: the mean of the per-position
+    // differences, and the standard error of that mean. A difference smaller
+    // than about two standard errors is not distinguishable from noise, and
+    // saying so is the difference between a measurement and a claim.
+    let paired = null;
+    if (baselineTokens === null) {
+      baselineTokens = perToken;
+    } else {
+      let sum = 0;
+      for (let i = 0; i < scored; i++) sum += perToken[i] - baselineTokens[i];
+      const mean = sum / scored;
+      let variance = 0;
+      for (let i = 0; i < scored; i++) {
+        const centred = (perToken[i] - baselineTokens[i]) - mean;
+        variance += centred * centred;
+      }
+      variance /= (scored - 1);
+      const stderr = Math.sqrt(variance / scored);
+      paired = { mean, stderr, t: stderr > 0 ? mean / stderr : 0 };
+    }
+
+    if (baseline === null) baseline = ppl;
+    rows.push({
+      label: scheme.label, bits: scheme.bits,
+      sizeMB: ((494032768 * scheme.bits) / 8 / 1e6).toFixed(0),
+      ppl, delta: baseline === ppl ? null : ((ppl - baseline) / baseline) * 100,
+      argmaxAgree, argmaxTotal, loadSeconds, scored, paired,
+    });
+    window.__rows = rows;
+    render();
+
+    // Release everything this scheme allocated before uploading the next set.
+    // Missing the scratch buffers and the rope tables leaks a little per
+    // scheme, which is enough to matter across four uploads of 988 MB.
+    for (const layer of model.w.layers) {
+      for (const buffer of Object.values(layer)) buffer.destroy();
+    }
+    model.w.embed.destroy();
+    model.w.finalNorm.destroy();
+    model.ropeTable.cos.destroy();
+    model.ropeTable.sin.destroy();
+    for (const held of model.scratch.values()) held.buffer.destroy();
+    model.scratch.clear();
+    for (const buffer of [...cache.keys, ...cache.values]) buffer.destroy();
+  }
+
+  window.__perplexity = { tokens: ids.length, scored: rows[0]?.scored, rows };
+  window.__done = true;
+  say(`done: ${ids.length} tokens, ${rows[0]?.scored} scored positions, ${rows.length} schemes`);
+} catch (error) {
+  window.__done = true;
+  window.__error = String(error) + '\n' + (error.stack ?? '');
+  log.innerHTML = `<span style="color:#b00">${String(error)}</span>`;
+  out.innerHTML = `<pre>${error.stack ?? ''}</pre>`;
+}
+</script>
