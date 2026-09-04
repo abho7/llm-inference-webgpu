@@ -104,6 +104,38 @@ export function ropeFrequencies(headDim, theta) {
 }
 
 /**
+ * Precomputed cosines and sines for every position and frequency.
+ *
+ * Returned as [positions, headDim/2] f32, computed here in f64.
+ *
+ * This exists because of a measured limit rather than as an optimisation. WGSL
+ * allows relaxed precision on sin and cos, and on the Iris Xe this project
+ * targets they are off by about 3.0e-5 absolute even for angles inside a single
+ * turn, rising to 5.9e-5 for the large angles late positions produce
+ * (web/precision.html measures it; pow is fine at 6.5 ULP). Evaluating the
+ * rotation on the GPU therefore cannot agree with this reference better than
+ * about 3e-5, which is 300 times worse than every other kernel manages.
+ *
+ * Computing the table once on the CPU removes the error source entirely and is
+ * also less work per token, since the alternative is two transcendentals per
+ * element per layer.
+ */
+export function ropeTables(headDim, theta, positions) {
+  const half = headDim >> 1;
+  const invFreq = ropeFrequencies(headDim, theta);
+  const cos = new Float32Array(positions * half);
+  const sin = new Float32Array(positions * half);
+  for (let p = 0; p < positions; p++) {
+    for (let j = 0; j < half; j++) {
+      const angle = p * invFreq[j];
+      cos[p * half + j] = Math.cos(angle);
+      sin[p * half + j] = Math.sin(angle);
+    }
+  }
+  return { cos, sin, half };
+}
+
+/**
  * Apply RoPE to one head vector, in place, at a given position.
  *
  * This is the half-split convention: element j pairs with element j + headDim/2,

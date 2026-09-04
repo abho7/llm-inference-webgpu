@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   rmsNorm, matVec, matVecBf16, softmaxInPlace, silu, swigluInPlace,
-  ropeFrequencies, ropeInPlace,
+  ropeFrequencies, ropeInPlace, ropeTables,
 } from '../src/core/ops.js';
 import { f32ToBf16 } from '../src/core/dtype.js';
 
@@ -258,4 +258,59 @@ test('rope applies to a slice at an offset, leaving neighbours alone', () => {
   assert.deepEqual([...buf.slice(0, 4)], [9, 9, 9, 9], 'the head before is untouched');
   assert.deepEqual([...buf.slice(8)], [7, 7, 7, 7], 'the head after is untouched');
   close(buf[4], Math.cos(1), 1e-6, 'the target head rotated');
+});
+
+test('the rope table reproduces the rotation computed directly', () => {
+  // The GPU rotates from this table instead of calling sin and cos, because on
+  // the target adapter those carry about 3e-5 of absolute error. The table has
+  // to be equivalent to the direct computation or the GPU is simply rotating
+  // by something else; the only permitted difference is that the table is
+  // stored in f32 while ropeInPlace works in f64.
+  const headDim = 64;
+  const theta = 1e6;
+  const positions = 40;
+  const heads = 3;
+
+  const tables = ropeTables(headDim, theta, positions);
+  const invFreq = ropeFrequencies(headDim, theta);
+  const half = headDim >> 1;
+  assert.equal(tables.half, half);
+  assert.equal(tables.cos.length, positions * half);
+
+  for (const position of [0, 1, 7, 39]) {
+    const direct = Float32Array.from(
+      { length: heads * headDim }, (_, i) => Math.sin(i * 0.3) + 0.1,
+    );
+    const viaTable = Float32Array.from(direct);
+
+    for (let h = 0; h < heads; h++) {
+      ropeInPlace(direct, h * headDim, headDim, position, invFreq);
+    }
+    for (let h = 0; h < heads; h++) {
+      const base = h * headDim;
+      for (let j = 0; j < half; j++) {
+        const c = tables.cos[position * half + j];
+        const s = tables.sin[position * half + j];
+        const lo = viaTable[base + j];
+        const hi = viaTable[base + j + half];
+        viaTable[base + j] = lo * c - hi * s;
+        viaTable[base + j + half] = hi * c + lo * s;
+      }
+    }
+    for (let i = 0; i < direct.length; i++) {
+      close(viaTable[i], direct[i], 1e-6, `position ${position} element ${i}`);
+    }
+  }
+});
+
+test('the rope table starts at the identity and stays bounded', () => {
+  const tables = ropeTables(64, 1e6, 2048);
+  for (let j = 0; j < tables.half; j++) {
+    assert.equal(tables.cos[j], 1, `cos at position 0, frequency ${j}`);
+    assert.equal(tables.sin[j], 0, `sin at position 0, frequency ${j}`);
+  }
+  for (let i = 0; i < tables.cos.length; i++) {
+    assert.ok(Math.abs(tables.cos[i]) <= 1.0000001 && Math.abs(tables.sin[i]) <= 1.0000001,
+      `entry ${i} outside [-1, 1]`);
+  }
 });
