@@ -45,15 +45,19 @@ var<workgroup> partial : array<f32, ${GROUP}>;
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_id) lid : vec3<u32>) {
   let row = wg.x + wg.y * params.gridWidth;
-  // Uniform across the workgroup, so the barriers below are still uniform.
+  // The third dispatch dimension is the position within the sequence, so one
+  // kernel serves both prefill and single-token decode. Uniform across the
+  // workgroup, like the row, so the barriers below stay uniform.
+  let b = wg.z;
   if (row >= params.rows) { return; }
 
   let base = row * params.cols;
+  let xBase = b * params.cols;
   var acc = 0.0;
   var c = lid.x;
   loop {
     if (c >= params.cols) { break; }
-    acc = acc + f32(W[base + c]) * x[c];
+    acc = acc + f32(W[base + c]) * x[xBase + c];
     c = c + ${GROUP}u;
   }
   partial[lid.x] = acc;
@@ -70,7 +74,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   if (lid.x == 0u) {
     var v = partial[0];
     if (params.hasBias == 1u) { v = v + bias[row]; }
-    y[row] = v;
+    y[b * params.rows + row] = v;
   }
 }`;
 

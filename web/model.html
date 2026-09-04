@@ -1,0 +1,181 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>GPU model comparison</title>
+<style>
+  body { font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem;
+         max-width: 74rem; color: #111; }
+  h1 { font-size: 1.15rem; margin-bottom: 0.2rem; }
+  p.lede { color: #444; max-width: 48rem; }
+  table { border-collapse: collapse; margin: 1rem 0; font-size: 12px; }
+  th, td { padding: 0.25rem 1.3rem 0.25rem 0; text-align: left; border-bottom: 1px solid #eee; }
+  th { color: #666; font-weight: normal; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .pass { color: #070; } .fail { color: #b00; font-weight: bold; }
+  #log { color: #666; font-size: 12px; white-space: pre-wrap; }
+</style>
+<h1>The GPU forward pass against the ONNX Runtime oracle</h1>
+<p class="lede">The whole model runs on the GPU with f16 weights, and its per-layer keys and
+values are compared against the ones ONNX Runtime produced in fp32
+(<code>golden/reference/</code>). Phase 1 established that the CPU reference agrees with that
+oracle to 9.1e-5 relative per layer; whatever this run adds on top is what f16 storage costs
+end to end, through 24 layers.</p>
+<div id="log">starting...</div>
+<div id="out"></div>
+
+<script type="module">
+import { GpuContext } from '../src/gpu/device.js';
+import { GpuModel } from '../src/gpu/model.js';
+import { Safetensors } from '../src/core/safetensors.js';
+import { FetchSource } from '../src/core/source-web.js';
+import { ModelConfig } from '../src/core/config.js';
+import { bf16ToF32Array } from '../src/core/dtype.js';
+
+const log = document.getElementById('log');
+const out = document.getElementById('out');
+const say = (m) => { log.textContent = m; console.log('[model]', m); };
+
+function compare(mine, theirs) {
+  let maxAbs = 0;
+  let scale = 0;
+  for (let i = 0; i < theirs.length; i++) {
+    const diff = Math.abs(mine[i] - theirs[i]);
+    if (diff > maxAbs) maxAbs = diff;
+    if (Math.abs(theirs[i]) > scale) scale = Math.abs(theirs[i]);
+  }
+  return { maxAbs, scale, rel: scale > 0 ? maxAbs / scale : 0 };
+}
+
+/** Reshape [positions, kvHeads*headDim] into the ONNX [kvHeads, positions, headDim]. */
+function toPresentLayout(flat, positions, numKVHeads, headDim) {
+  const kvDim = numKVHeads * headDim;
+  const out = new Float32Array(numKVHeads * positions * headDim);
+  for (let h = 0; h < numKVHeads; h++) {
+    for (let t = 0; t < positions; t++) {
+      for (let i = 0; i < headDim; i++) {
+        out[(h * positions + t) * headDim + i] = flat[t * kvDim + h * headDim + i];
+      }
+    }
+  }
+  return out;
+}
+
+try {
+  const base = '..';
+  const config = ModelConfig.parse(await (await fetch(`${base}/weights/config.json`)).text());
+  const manifest = await (await fetch(`${base}/golden/reference/manifest.json`)).json();
+
+  say('opening the weights over HTTP range requests...');
+  const st = await Safetensors.open(await FetchSource.open(`${base}/weights/model.safetensors`));
+  config.checkAgainst(st);
+
+  const ctx = await GpuContext.create();
+  const started = performance.now();
+  const model = await GpuModel.load(ctx, st, config, {
+    maxPositions: 512,
+    onProgress: (done, total, what) => {
+      if (done % 12 === 0 || done === total) {
+        say(`uploading weights as f16: ${done}/${total} (${what})`);
+      }
+    },
+  });
+  const loadSeconds = (performance.now() - started) / 1000;
+  say(`weights on the GPU: ${(ctx.bytesUploaded / 1e6).toFixed(0)} MB in ${loadSeconds.toFixed(1)}s`);
+
+  // The embedding gather stays on the CPU; read the rows we need directly.
+  const embedInfo = st.info('model.embed_tokens.weight');
+  const d = config.hiddenSize;
+  async function embed(ids) {
+    const outArr = new Float32Array(ids.length * d);
+    for (let t = 0; t < ids.length; t++) {
+      const bytes = await st.readRawRange('model.embed_tokens.weight', ids[t] * d * 2, d * 2);
+      const aligned = bytes.byteOffset % 2 === 0 ? bytes : new Uint8Array(bytes);
+      outArr.set(bf16ToF32Array(new Uint16Array(aligned.buffer, aligned.byteOffset, d)), t * d);
+    }
+    return outArr;
+  }
+
+  const rows = [];
+  let worstLayer = 0;
+  let worstLogit = 0;
+  let argmaxAgree = 0;
+
+  for (const entry of manifest.cases) {
+    if (entry.seq > 32) continue;
+    say(`running case ${entry.index}: ${JSON.stringify(entry.prompt.slice(0, 40))}`);
+
+    const golden = new Float32Array(
+      await (await fetch(`${base}/golden/reference/${entry.bin}`)).arrayBuffer(),
+    );
+    const per = entry.present_floats_per_tensor;
+
+    const cache = model.newCache(entry.seq + 4);
+    const hidden = await embed(entry.input_ids);
+    const t0 = performance.now();
+    const result = await model.forward(hidden, entry.seq, {
+      cache, wantLogits: true, wantPresent: true,
+    });
+    const seconds = (performance.now() - t0) / 1000;
+
+    let layerWorst = { rel: 0, layer: -1, kind: '' };
+    for (let layer = 0; layer < manifest.layers; layer++) {
+      for (const [j, kind] of ['key', 'value'].entries()) {
+        const want = golden.subarray((layer * 2 + j) * per, (layer * 2 + j) * per + per);
+        const mine = toPresentLayout(result.present[layer][kind], entry.seq,
+          config.numKVHeads, config.headDim);
+        const stat = compare(mine, want);
+        if (stat.rel > layerWorst.rel) layerWorst = { ...stat, layer, kind };
+      }
+    }
+
+    const wantLogits = golden.subarray(manifest.layers * 2 * per,
+      manifest.layers * 2 * per + entry.logits_floats);
+    const logitStat = compare(result.logits, wantLogits);
+
+    let argmax = 0;
+    for (let i = 1; i < result.logits.length; i++) {
+      if (result.logits[i] > result.logits[argmax]) argmax = i;
+    }
+    const agree = argmax === entry.argmax;
+    if (agree) argmaxAgree++;
+    worstLayer = Math.max(worstLayer, layerWorst.rel);
+    worstLogit = Math.max(worstLogit, logitStat.rel);
+
+    rows.push({ index: entry.index, prompt: entry.prompt, seq: entry.seq, seconds,
+      layerRel: layerWorst.rel, layerAt: `${layerWorst.layer} ${layerWorst.kind}`,
+      logitRel: logitStat.rel, argmax, wanted: entry.argmax, agree });
+
+    out.innerHTML = `<table>
+      <tr><th>case</th><th>tokens</th><th>seconds</th><th>worst layer</th><th>at</th>
+          <th>logits</th><th>argmax</th></tr>
+      ${rows.map((r) => `<tr>
+        <td>${JSON.stringify(r.prompt.slice(0, 26))}</td>
+        <td class="num">${r.seq}</td>
+        <td class="num">${r.seconds.toFixed(2)}</td>
+        <td class="num">${r.layerRel.toExponential(2)}</td>
+        <td>${r.layerAt}</td>
+        <td class="num">${r.logitRel.toExponential(2)}</td>
+        <td class="${r.agree ? 'pass' : 'fail'}">${r.agree ? `${r.argmax} agree`
+          : `${r.argmax} vs ${r.wanted}`}</td></tr>`).join('')}
+    </table>`;
+  }
+
+  const ok = argmaxAgree === rows.length;
+  window.__model = { ok, rows, worstLayer, worstLogit, argmaxAgree,
+    uploadedBytes: ctx.bytesUploaded, loadSeconds };
+  window.__done = true;
+  say(`done: ${(ctx.bytesUploaded / 1e6).toFixed(0)} MB of f16 weights, ` +
+    `${rows.length} cases`);
+  out.innerHTML += `<p class="${ok ? 'pass' : 'fail'}">${ok
+    ? `PASS: the GPU picks the same token as the oracle on all ${rows.length} cases; ` +
+      `worst per-layer ${worstLayer.toExponential(2)} relative, ` +
+      `worst logit ${worstLogit.toExponential(2)} relative`
+    : 'FAIL: the GPU and the oracle disagree on which token comes next'}</p>`;
+  document.title = ok ? 'GPU model: ok' : 'GPU model: FAILED';
+} catch (error) {
+  window.__done = true;
+  window.__error = String(error) + '\n' + (error.stack ?? '');
+  log.innerHTML = `<span class="fail">${String(error)}</span>`;
+  out.innerHTML = `<pre>${error.stack ?? ''}</pre>`;
+  document.title = 'GPU model: ERROR';
+}
+</script>

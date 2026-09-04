@@ -9,12 +9,11 @@ No PyTorch, no `transformers`, no tokenizer library. The safetensors container,
 the bfloat16 conversion, the BPE tokenizer, the attention kernels and the
 quantization are all in this repository.
 
-> **Status: Phase 3 of 6, in progress.** The model runs, caches its keys and
-> values, and generates text that matches an independent implementation token
-> for token. The WebGPU kernels are written and every one of them agrees with
-> the CPU reference; wiring them into a full GPU forward pass is the next step.
-> The table marks what is actually done, and nothing is claimed before it is
-> measured.
+> **Status: Phase 3 of 6.** The whole model runs on the GPU with f16 weights
+> and picks the same next token as ONNX Runtime on every test prompt. What is
+> left is speed: the kernels are unfused and untiled on purpose, and no
+> throughput claim is made yet. The table marks what is actually done, and
+> nothing is claimed before it is measured.
 
 ## What this sets out to prove
 
@@ -27,7 +26,7 @@ already do that. The claims worth making are narrower and checkable:
 | 2 | Tokenization is identical to the reference on a corpus | 0 | **done** |
 | 3 | Logits match ONNX Runtime to a stated tolerance, per layer | 1 | **done** |
 | 4 | Incremental decode with a KV cache equals full recomputation | 2 | **done** |
-| 5 | The WebGPU backend matches the CPU reference within f16 tolerance | 3 | not started |
+| 5 | The WebGPU backend matches the CPU reference within f16 tolerance | 3 | **done** |
 | 6 | Quantization error is characterised per layer, not just end to end | 4 | not started |
 | 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | not started |
 
@@ -55,16 +54,62 @@ different questions:
 
 The middle column feeds the CPU the *same f16-rounded weights* the GPU holds,
 so it isolates whether the kernel is correct: everything lands at 1e-7, which
-is f32 accumulation order and nothing else. The right column compares against
-full-precision weights, so it prices f16 storage: about 2e-4, a thousand times
-larger. Those are two different facts and reporting one number would have
-blurred them.
+is f32 accumulation order and nothing else.
 
-Precision is stated rather than inherited: weights are f16 in storage,
-activations f32, every dot product accumulated in f32. Weights are the
-bandwidth bottleneck at batch one and activations are not, and no weight in
-this model exceeds 214 against an f16 maximum of 65504, so the conversion
-cannot overflow.
+The right column is easy to misread, and I nearly did. It says that rounding a
+matrix of **random f32 values** to f16 moves the answer by about 2e-4 — which
+is true, and is not what happens to this model, because these weights are not
+f32. They are bfloat16: 7 mantissa bits against f16's 10. The mantissa is
+*wider* in f16, so the conversion cannot lose precision at all; only f16's
+narrower exponent range costs anything.
+
+`validate/f16-fidelity.js` walks all 494,032,768 weights:
+
+| | |
+|---|---|
+| changed by bf16 to f16 | 123,027 (0.0249%) |
+| flushed to zero | 1,463 |
+| overflowed | 0 |
+| worst relative change, normal range | **exactly 0** |
+| largest weight | 214, against an f16 ceiling of 65504 |
+
+Every weight f16 can represent normally converts bit-exactly. The 0.0249% that
+change are all below 6.1e-5 in magnitude, where f16 goes subnormal and starts
+dropping bits. So for this model, f16 storage is very nearly free — which the
+end-to-end run below then confirms independently.
+
+Precision is stated rather than inherited: weights f16 in storage, activations
+f32, every dot product accumulated in f32. Weights are the bandwidth bottleneck
+at batch one and activations are not.
+
+### The whole model on the GPU
+
+`web/model.html` runs the full forward pass on the GPU and compares its
+per-layer keys and values against the fp32 ONNX Runtime oracle, the same golden
+files phase 1 used.
+
+| prompt | tokens | seconds | worst layer | logits | argmax |
+|---|---|---|---|---|---|
+| "The capital of France is" | 5 | 1.21 | 9.54e-6 | 2.85e-6 | 12095 agree |
+| "A" | 1 | 0.79 | 9.49e-6 | 4.74e-6 | 220 agree |
+| "def fibonacci(n):" | 4 | 0.58 | 6.69e-6 | 1.52e-6 | 715 agree |
+| "the the the the the" | 5 | 0.62 | 6.43e-5 | 3.96e-6 | 3491 agree |
+| chat template, 2+2 | 15 | 0.80 | 1.84e-5 | 2.89e-6 | 17 agree |
+
+Worst per-layer 6.4e-5 relative, worst logit 4.7e-6, and the same next token as
+the oracle on all five.
+
+The striking part is that those are *better* than the CPU reference's own
+numbers against the same oracle (9.1e-5 per layer, 6.6e-6 on logits), which
+looks impossible for a backend using half the precision until the fidelity
+measurement above explains it: the f16 weights are the same numbers, and the
+GPU accumulates in f32 with a tree reduction whose error grows like log(n)
+rather than the sequential sum's n.
+
+988 MB of f16 weights upload in 88 seconds and sit in 2 GB of shared VRAM. The
+per-prompt times are prefill only and are not a throughput claim: prefill runs
+a matrix-vector product per position rather than a real matrix multiply, the
+kernels are unfused, and nothing has been tuned. That is phase 5.
 
 ### The rotary embedding could not be computed on the GPU
 
@@ -101,6 +146,7 @@ node tools/serve.js                       # serves the repo with HTTP range supp
 #   /web/probe.html      adapter features, limits, and a compute shader with a known answer
 #   /web/kernels.html    every kernel against the CPU reference
 #   /web/precision.html  what this adapter's transcendentals actually cost
+#   /web/model.html      the whole model on the GPU, against the ONNX oracle
 ```
 
 Range support is not incidental: the weights are 988 MB and the page needs
@@ -355,6 +401,7 @@ node --test                        # 84 tests
 node validate/phase0.js            # loader and tokenizer gate
 node validate/phase1.js            # forward-pass gate against ONNX Runtime
 node validate/phase2.js            # KV cache gate, bit-exact
+node validate/f16-fidelity.js     # what f16 storage costs these weights
 node validate/generate.js "The capital of France is" 8
 node validate/layer-profile.js 3   # where the disagreement grows
 node validate/activation-scale.js  # which channels are outliers
