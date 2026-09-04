@@ -9,10 +9,10 @@ No PyTorch, no `transformers`, no tokenizer library. The safetensors container,
 the bfloat16 conversion, the BPE tokenizer, the attention kernels and the
 quantization are all in this repository.
 
-> **Status: Phase 4 of 6.** The model runs on the GPU, agrees with ONNX Runtime
-> per layer, and has been quantized to 8 and 4 bits with the damage measured
-> rather than asserted. What is left is speed: the kernels are unfused and
-> untiled on purpose, and no throughput claim is made yet.
+> **Status: Phase 5 of 6.** The model runs on the GPU, agrees with ONNX Runtime
+> per layer, quantizes to 8 and 4 bits with the damage measured, and has now
+> been benchmarked against a real inference runtime -- which beats it. By how
+> much, and where the time actually goes, is below.
 
 ## What this sets out to prove
 
@@ -27,7 +27,93 @@ already do that. The claims worth making are narrower and checkable:
 | 4 | Incremental decode with a KV cache equals full recomputation | 2 | **done** |
 | 5 | The WebGPU backend matches the CPU reference within f16 tolerance | 3 | **done** |
 | 6 | Quantization error is characterised per layer, not just end to end | 4 | **done** |
-| 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | not started |
+| 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | **done** |
+
+## Phase 5: how fast it is, and losing to ONNX Runtime
+
+The baseline is ONNX Runtime on the CPU of this same machine, running the same
+model. It is a mature, heavily optimised implementation, which is the point: an
+engine written from scratch should be judged against one, not against a softer
+opponent.
+
+| | this engine (WebGPU) | ONNX Runtime (CPU) | ratio |
+|---|---|---|---|
+| prefill, 52-token prompt | 1233 ms, **42 tok/s** | 218 ms, **238 tok/s** | ORT 5.6x faster |
+| decode, median step | 86.8 ms, **11.5 tok/s** | 67.5 ms, **14.8 tok/s** | ORT 1.3x faster |
+
+So it loses, and the prefill gap is the larger one. That is not mysterious:
+prefill here runs a matrix-*vector* product per position, with the sequence in
+the third dispatch dimension, rather than a real matrix multiply. One kernel
+serving both prefill and decode was a deliberate phase 3 choice to keep a single
+code path while correctness was being established, and this is what it costs.
+
+The ONNX Runtime figure is itself a lower bound: it passes the past keys and
+values as ordinary tensors, so every step copies the whole cache in and out.
+Binding them in place would make it faster still.
+
+### Where a decode step actually goes
+
+Kernels are timed on the GPU's own clock. That clock is coarsened by the browser
+to a measured quantum of **65.54 us**, far longer than any kernel here takes, so
+each kernel is timed as 256 dispatches inside one pass and divided down. The
+quantum is not assumed: it is recovered as the greatest common divisor of the
+raw pass totals.
+
+| kernel | per token | share of GPU time |
+|---|---|---|
+| gate/up (4864x896, twice per layer) | 14.72 ms | 40% |
+| lm_head (151936x896, once per token) | 9.05 ms | 25% |
+| down (896x4864) | 5.92 ms | 16% |
+| attention | 1.98 ms | 5% |
+| o_proj (896x896) | 1.94 ms | 5% |
+| q_proj (896x896) | 1.87 ms | 5% |
+| rmsnorm, k_proj, rope, swiglu, add | 1.01 ms | 3% |
+
+| | |
+|---|---|
+| GPU time accounted for | 36.5 ms |
+| logits readback, 608 KB | 5.8 ms |
+| measured decode step | 86.8 ms |
+| **unaccounted** | **44.5 ms (51%)** |
+
+The MLP is 56% of GPU time across three matrices, and the output projection
+alone is a quarter -- worth remembering that this model ties its embeddings, so
+that 151936x896 matrix is 27% of the parameters and gets read once per token to
+produce a single argmax.
+
+### A hypothesis I tested and had to drop
+
+Half the decode step was outside the kernels, and the obvious explanation was
+submission overhead: the engine created a command encoder and submitted it for
+every single dispatch, roughly 400 submissions per token. Batching the whole
+forward pass into one command buffer took that to exactly 1.
+
+It did not measurably speed anything up. Decode steps across five runs came out
+at 175, 151, 141 and 87 ms, with the two fastest and the slowest both on the
+batched code. The change is still in -- 400 submissions per token is
+indefensible regardless -- but the honest conclusion is that submission count
+was not the bottleneck, and I would have reported it as one if I had shipped the
+optimisation without re-measuring.
+
+### The numbers move, and pretending otherwise would be worse
+
+The per-kernel table is a median of three rounds, and it reports every round,
+because an early version reported a single reading and a later run disagreed
+with it by a factor of four on the same kernel with unchanged code.
+
+The instability is specific and explainable. Most kernels repeat tightly --
+q_proj measured 272, 276, 272 us across rounds. The two exceptions are the
+largest matrices: gate/up went 1080, 430, 296 us and lm_head went 12.4, 9.4,
+9.2 ms, each settling downward. This is an integrated GPU allocating out of
+system memory on a machine with about 1.3 GB free, so the first touch of a large
+weight matrix pays for residency and later touches do not.
+
+Prefill, by contrast, is stable to under 1% within a run (1226, 1233, 1235 ms),
+because a 52-token prefill touches everything several times over.
+
+Decode across whole runs spans 87 to 175 ms, a factor of two. The best figure is
+quoted above and the range is quoted here; quoting only the first would be a
+coin flip presented as a measurement.
 
 ## Phase 4: quantization, and a prediction that turned out wrong
 
@@ -241,6 +327,7 @@ node tools/serve.js                       # serves the repo with HTTP range supp
 #   /web/precision.html  what this adapter's transcendentals actually cost
 #   /web/model.html      the whole model on the GPU, against the ONNX oracle
 #   /web/perplexity.html perplexity under each quantization scheme
+#   /web/bench.html      throughput, time to first token, per-kernel breakdown
 ```
 
 Range support is not incidental: the weights are 988 MB and the page needs
@@ -500,6 +587,7 @@ node validate/f16-fidelity.js     # what f16 storage costs these weights
 node validate/quantization-error.js    # per-tensor error for every scheme
 node validate/quantization-outliers.js # which channels carry the damage
 node validate/perplexity.js       # paired perplexity, f16 vs int8 vs int4
+python oracle/bench_ort.py        # the ONNX Runtime baseline to be judged against
 node validate/generate.js "The capital of France is" 8
 node validate/layer-profile.js 3   # where the disagreement grows
 node validate/activation-scale.js  # which channels are outliers
@@ -518,9 +606,13 @@ skip rather than fail.
 Intel Core i7-1355U, 10 cores / 12 threads, 16 GB RAM, Intel Iris Xe
 (`gen-12lp`) with 2 GB of shared VRAM. WebGPU on this adapter reports
 `shader-f16`, `subgroups`, `timestamp-query` and `float32-filterable`, a 2 GB
-maximum storage buffer and 32 KB of workgroup shared memory. Decode on an
-integrated GPU is memory-bandwidth-bound, so the throughput figures in phase 5
-will be modest in absolute terms and will say so.
+maximum storage buffer and 32 KB of workgroup shared memory, and coarsens GPU
+timestamps to a 65.54 us quantum.
+
+The GPU is integrated, so its memory is system memory, and during these runs the
+machine had roughly 1.3 GB free while holding 988 MB of weights resident. That
+is the source of the run-to-run variance in phase 5, and it is why the
+throughput figures come with a range rather than a single digit.
 
 ## Licence
 
