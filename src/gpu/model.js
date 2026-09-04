@@ -191,6 +191,10 @@ export class GpuModel {
     const x = this.#buf('x', seq * d);
     ctx.device.queue.writeBuffer(x, 0, hidden.buffer, hidden.byteOffset, hidden.byteLength);
 
+    // Record the whole forward pass into one command buffer. Submitting each
+    // dispatch separately costs more than the dispatches do.
+    ctx.begin('forward');
+
     const normed = this.#buf('normed', seq * d);
     const q = this.#buf('q', seq * d);
     const k = this.#buf('k', seq * kvDim);
@@ -233,10 +237,8 @@ export class GpuModel {
         [Math.ceil(kPairs / 64)], 'rope-k');
 
       // Append this layer's keys and values to the cache.
-      const encoder = ctx.device.createCommandEncoder({ label: 'kv-append' });
-      encoder.copyBufferToBuffer(k, 0, cache.keys[layer], past * kvDim * 4, seq * kvDim * 4);
-      encoder.copyBufferToBuffer(v, 0, cache.values[layer], past * kvDim * 4, seq * kvDim * 4);
-      ctx.device.queue.submit([encoder.finish()]);
+      ctx.copy(k, 0, cache.keys[layer], past * kvDim * 4, seq * kvDim * 4);
+      ctx.copy(v, 0, cache.values[layer], past * kvDim * 4, seq * kvDim * 4);
 
       const attnParams = pack(ctx, [
         ['u32', seq], ['u32', past], ['u32', cfg.numHeads], ['u32', cfg.numKVHeads],
@@ -264,9 +266,7 @@ export class GpuModel {
       // Only the final position's logits are wanted, so normalise that row and
       // run the output projection over it alone rather than over the sequence.
       const lastRow = this.#buf('lastRow', d);
-      const encoder = ctx.device.createCommandEncoder({ label: 'last-row' });
-      encoder.copyBufferToBuffer(x, (seq - 1) * d * 4, lastRow, 0, d * 4);
-      ctx.device.queue.submit([encoder.finish()]);
+      ctx.copy(x, (seq - 1) * d * 4, lastRow, 0, d * 4);
 
       const oneRowNorm = pack(ctx, [['u32', 1], ['u32', d], ['f32', cfg.rmsNormEps], ['u32', 0]]);
       const normedLast = this.#buf('normedLast', d);
@@ -279,9 +279,12 @@ export class GpuModel {
       ]);
       ctx.dispatch(MATVEC, [this.w.embed, normedLast, noBias, logitBuf, params],
         [grid[0], grid[1], 1], 'lm_head');
+      ctx.flush();
       await ctx.done();
       logits = await ctx.readF32(logitBuf, cfg.vocabSize);
     }
+
+    ctx.flush();
 
     let present = null;
     if (wantPresent) {

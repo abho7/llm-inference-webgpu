@@ -25,6 +25,9 @@ export class GpuContext {
     this.features = features;
     this.pipelines = new Map();
     this.bytesUploaded = 0;
+    // When set, dispatch() records into this encoder instead of submitting.
+    this.recording = null;
+    this.submissions = 0;
   }
 
   static async create({ requireF16 = true } = {}) {
@@ -110,6 +113,42 @@ export class GpuContext {
     return pipeline;
   }
 
+  /**
+   * Start recording. Until flush(), dispatch() and copy() append to a single
+   * command encoder rather than submitting one at a time.
+   *
+   * This matters more than it sounds. A decode step is about 360 dispatches,
+   * and submitting each one separately means 360 round trips into the driver
+   * for roughly 100 microseconds of actual work apiece. Measurement put 77% of
+   * a decode step outside the kernels; this is where that went.
+   */
+  begin(label = 'forward') {
+    if (this.recording) throw new Error('already recording');
+    this.recording = this.device.createCommandEncoder({ label });
+    return this.recording;
+  }
+
+  /** Submit everything recorded since begin(). */
+  flush() {
+    if (!this.recording) return;
+    const encoder = this.recording;
+    this.recording = null;
+    this.device.queue.submit([encoder.finish()]);
+    this.submissions++;
+  }
+
+  /** Copy between buffers, recorded if recording and submitted otherwise. */
+  copy(src, srcOffset, dst, dstOffset, bytes) {
+    if (this.recording) {
+      this.recording.copyBufferToBuffer(src, srcOffset, dst, dstOffset, bytes);
+      return;
+    }
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(src, srcOffset, dst, dstOffset, bytes);
+    this.device.queue.submit([encoder.finish()]);
+    this.submissions++;
+  }
+
   /** Run one kernel over `buffers`, dispatching a grid of workgroups. */
   dispatch(code, buffers, grid, label = 'kernel') {
     const pipeline = this.pipeline(code, label);
@@ -117,13 +156,16 @@ export class GpuContext {
       layout: pipeline.getBindGroupLayout(0),
       entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
-    const encoder = this.device.createCommandEncoder({ label });
+    const encoder = this.recording ?? this.device.createCommandEncoder({ label });
     const pass = encoder.beginComputePass({ label });
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(grid[0], grid[1] ?? 1, grid[2] ?? 1);
     pass.end();
-    this.device.queue.submit([encoder.finish()]);
+    if (!this.recording) {
+      this.device.queue.submit([encoder.finish()]);
+      this.submissions++;
+    }
   }
 
   /** Copy a buffer back to the CPU as f32. */
@@ -144,6 +186,99 @@ export class GpuContext {
   }
 
   async done() { await this.device.queue.onSubmittedWorkDone(); }
+
+  /**
+   * Run `count` dispatches inside one submission, timing each on the GPU.
+   *
+   * `build` is called with an encoder and an index and should record one
+   * compute pass per call. Timestamps come from the GPU's own clock rather than
+   * from wall time on the CPU, which is the only way to separate how long a
+   * kernel takes from how long the browser took to hand it over.
+   *
+   * Returns nanoseconds per dispatch. Browsers deliberately coarsen this clock,
+   * so the caller is expected to check the granularity rather than trust the
+   * digits: see bench/granularity below.
+   */
+  async timed(count, build) {
+    if (!this.features.has('timestamp-query')) {
+      throw new Error('this adapter has no timestamp-query');
+    }
+    const querySet = this.device.createQuerySet({ type: 'timestamp', count: count * 2 });
+    const resolved = this.device.createBuffer({
+      size: count * 2 * 8,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    });
+    const staging = this.device.createBuffer({
+      size: count * 2 * 8,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const encoder = this.device.createCommandEncoder({ label: 'timed' });
+    for (let i = 0; i < count; i++) {
+      build(encoder, i, {
+        querySet, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1,
+      });
+    }
+    encoder.resolveQuerySet(querySet, 0, count * 2, resolved, 0);
+    encoder.copyBufferToBuffer(resolved, 0, staging, 0, count * 2 * 8);
+    this.device.queue.submit([encoder.finish()]);
+    await this.device.queue.onSubmittedWorkDone();
+
+    await staging.mapAsync(GPUMapMode.READ);
+    const stamps = new BigInt64Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+    resolved.destroy();
+    querySet.destroy();
+
+    const out = new Float64Array(count);
+    for (let i = 0; i < count; i++) {
+      out[i] = Number(stamps[i * 2 + 1] - stamps[i * 2]);
+    }
+    return out;
+  }
+
+  /**
+   * Record one compute pass containing `repeats` dispatches of the same kernel.
+   *
+   * This exists because the browser coarsens the GPU clock -- on this adapter to
+   * multiples of about 65 microseconds -- which is far longer than any single
+   * kernel here takes. Timing one dispatch therefore reads as either zero or one
+   * whole quantum, and neither is the answer. Timing hundreds inside one pass
+   * and dividing brings the quantisation error down to a few nanoseconds per
+   * call.
+   *
+   * The dispatches all write the same buffer, so the implementation has to order
+   * them; they cannot overlap and be counted once.
+   */
+  encodeRepeated(encoder, code, buffers, grid, repeats, timestampWrites, label = 'kernel') {
+    const pipeline = this.pipeline(code, label);
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+    });
+    const pass = encoder.beginComputePass(timestampWrites ? { label, timestampWrites } : { label });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    for (let i = 0; i < repeats; i++) {
+      pass.dispatchWorkgroups(grid[0], grid[1] ?? 1, grid[2] ?? 1);
+    }
+    pass.end();
+  }
+
+  /** Record one timed compute pass for `code` over `buffers`. */
+  encodeDispatch(encoder, code, buffers, grid, timestampWrites, label = 'kernel') {
+    const pipeline = this.pipeline(code, label);
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+    });
+    const pass = encoder.beginComputePass(timestampWrites ? { label, timestampWrites } : { label });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(grid[0], grid[1] ?? 1, grid[2] ?? 1);
+    pass.end();
+  }
 
   describe() {
     const l = this.adapter.limits;

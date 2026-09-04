@@ -1,0 +1,325 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Throughput</title>
+<style>
+  body { font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem;
+         max-width: 72rem; color: #111; }
+  h1 { font-size: 1.15rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1rem; margin-top: 1.8rem; }
+  p.lede { color: #444; max-width: 47rem; }
+  table { border-collapse: collapse; margin: 1rem 0; font-size: 12px; }
+  th, td { padding: 0.28rem 1.4rem 0.28rem 0; text-align: left; border-bottom: 1px solid #eee; }
+  th { color: #666; font-weight: normal; }
+  td.num { font-variant-numeric: tabular-nums; }
+  #log { color: #666; font-size: 12px; }
+  .bar { display: inline-block; height: 9px; background: #6a7fd6; vertical-align: middle; }
+</style>
+<h1>How fast is this, really?</h1>
+<p class="lede">Prefill and decode throughput on this machine, with the hardware named, plus
+a per-kernel breakdown taken from the GPU's own clock. The kernels are unfused and untiled
+by design, so the interesting question is not just the total but where the total goes -- and
+in particular whether the engine is limited by arithmetic or by the cost of handing several
+hundred tiny dispatches to the driver.</p>
+<div id="log">starting...</div>
+<div id="out"></div>
+
+<script type="module">
+import { GpuContext, grid2d } from '../src/gpu/device.js';
+import { GpuModel } from '../src/gpu/model.js';
+import { MATVEC, RMSNORM, ROPE, ATTENTION, SWIGLU, ADD, GROUP } from '../src/gpu/kernels.js';
+import { Safetensors } from '../src/core/safetensors.js';
+import { FetchSource } from '../src/core/source-web.js';
+import { ModelConfig } from '../src/core/config.js';
+import { Tokenizer } from '../src/core/tokenizer.js';
+import { bf16ToF32Array } from '../src/core/dtype.js';
+
+const log = document.getElementById('log');
+const out = document.getElementById('out');
+const say = (m) => { log.textContent = m; console.log('[bench]', m); };
+const sections = [];
+const show = () => { out.innerHTML = sections.join(''); };
+
+function packUniform(ctx, fields) {
+  const size = Math.max(16, Math.ceil(fields.length / 4) * 16);
+  const buf = new ArrayBuffer(size);
+  const view = new DataView(buf);
+  fields.forEach(([kind, v], i) => {
+    if (kind === 'u32') view.setUint32(i * 4, v, true); else view.setFloat32(i * 4, v, true);
+  });
+  return ctx.uniform(new Uint32Array(buf));
+}
+
+/** Dispatches per timed pass, chosen so the clock's quantum divides down small. */
+const REPEATS = 256;
+
+const median = (a) => {
+  const s = [...a].sort((x, y) => x - y);
+  return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+};
+
+try {
+  const base = '..';
+  const config = ModelConfig.parse(await (await fetch(`${base}/weights/config.json`)).text());
+  const tokenizer = Tokenizer.fromJSON(await (await fetch(`${base}/weights/tokenizer.json`)).text());
+  const st = await Safetensors.open(await FetchSource.open(`${base}/weights/model.safetensors`));
+  const ctx = await GpuContext.create();
+  const d = config.hiddenSize;
+
+  say('uploading weights...');
+  const model = await GpuModel.load(ctx, st, config, {
+    maxPositions: 1024,
+    onProgress: (done, total) => { if (done % 40 === 0) say(`uploading ${done}/${total}`); },
+  });
+
+  async function embed(ids) {
+    const arr = new Float32Array(ids.length * d);
+    for (let t = 0; t < ids.length; t++) {
+      const bytes = await st.readRawRange('model.embed_tokens.weight', ids[t] * d * 2, d * 2);
+      const aligned = bytes.byteOffset % 2 === 0 ? bytes : new Uint8Array(bytes);
+      arr.set(bf16ToF32Array(new Uint16Array(aligned.buffer, aligned.byteOffset, d)), t * d);
+    }
+    return arr;
+  }
+
+  // ------------------------------------------------------------ time to first --
+  const PROMPT = 'The theory of computation asks what problems can be solved by machines, '
+    + 'and how much time and memory the solutions need. A Turing machine is deliberately '
+    + 'impoverished: a tape, a head that reads and writes one symbol at a time, and a '
+    + 'finite table of rules.';
+  const ids = tokenizer.encode(PROMPT);
+  const hidden = await embed(ids);
+
+  say(`prefilling ${ids.length} tokens...`);
+  // One warm run first: the first dispatch of each pipeline pays for shader
+  // compilation, which no later token pays for.
+  {
+    const warm = model.newCache(ids.length + 4);
+    await model.forward(hidden.subarray(0, 4 * d), 4, { cache: warm, wantLogits: true });
+    for (const b of [...warm.keys, ...warm.values]) b.destroy();
+  }
+
+  // Three prefills, reporting the median. A single reading moved by nearly a
+  // factor of two between runs on this machine, which is a shared integrated
+  // GPU competing with everything else on the box; one number would be a
+  // coin flip presented as a measurement.
+  const ttftRuns = [];
+  let first = null;
+  let prefillCache = null;
+  for (let run = 0; run < 3; run++) {
+    if (prefillCache) for (const b of [...prefillCache.keys, ...prefillCache.values]) b.destroy();
+    prefillCache = model.newCache(ids.length + 64);
+    const t0 = performance.now();
+    first = await model.forward(hidden, ids.length, { cache: prefillCache, wantLogits: true });
+    ttftRuns.push(performance.now() - t0);
+  }
+  const ttft = median(ttftRuns);
+
+  let token = 0;
+  for (let i = 1; i < first.logits.length; i++) if (first.logits[i] > first.logits[token]) token = i;
+
+  // ------------------------------------------------------------------ decode --
+  const DECODE = 32;
+  const stepMs = [];
+  const generated = [token];
+  for (let i = 0; i < DECODE; i++) {
+    const row = await embed([token]);
+    const s0 = performance.now();
+    const { logits } = await model.forward(row, 1, { cache: prefillCache, wantLogits: true });
+    stepMs.push(performance.now() - s0);
+    let best = 0;
+    for (let j = 1; j < logits.length; j++) if (logits[j] > logits[best]) best = j;
+    token = best;
+    generated.push(token);
+    if (i % 8 === 0) say(`decoding ${i}/${DECODE}`);
+  }
+
+  const medianStep = median(stepMs);
+  sections.push(`<h2>End to end</h2>
+    <table>
+      <tr><th></th><th>time</th><th>rate</th></tr>
+      <tr><td>time to first token (${ids.length}-token prompt)</td>
+          <td class="num">${ttft.toFixed(0)} ms</td>
+          <td class="num">${(ids.length / (ttft / 1000)).toFixed(1)} tok/s prefill</td></tr>
+      <tr><td>&nbsp;&nbsp;three prefill runs</td>
+          <td class="num" colspan="2">${ttftRuns.map((v) => v.toFixed(0)).join(', ')} ms</td></tr>
+      <tr><td>decode, median step</td>
+          <td class="num">${medianStep.toFixed(1)} ms</td>
+          <td class="num">${(1000 / medianStep).toFixed(2)} tok/s</td></tr>
+      <tr><td>decode, slowest step</td>
+          <td class="num">${Math.max(...stepMs).toFixed(1)} ms</td><td></td></tr>
+    </table>
+    <p class="lede">Continuation: <code>${
+      tokenizer.decode(generated).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))
+    }</code></p>`);
+  show();
+
+  // -------------------------------------------------------- per-kernel timing --
+  // Each kernel is run many times in one submission and the total divided down,
+  // so a per-call cost well below the clock's granularity is still measurable.
+  say('timing individual kernels...');
+  const kvDim = config.kvDim;
+  const ffn = config.intermediateSize;
+  const w0 = model.w.layers[0];
+  const scratchX = ctx.empty(d * 4, 'bx');
+  const scratchN = ctx.empty(d * 4, 'bn');
+  const scratchQ = ctx.empty(d * 4, 'bq');
+  const scratchKV = ctx.empty(kvDim * 4, 'bkv');
+  const scratchFfn = ctx.empty(ffn * 4, 'bf');
+  const scratchFfn2 = ctx.empty(ffn * 4, 'bf2');
+  const scratchLogits = ctx.empty(config.vocabSize * 4, 'bl');
+  const noBias = ctx.empty(4, 'nb');
+  const total = prefillCache.length;
+  const scores = ctx.empty(config.numHeads * total * 4, 'bs');
+
+  const normParams = packUniform(ctx, [['u32', 1], ['u32', d], ['f32', config.rmsNormEps], ['u32', 0]]);
+  const addParams = packUniform(ctx, [['u32', d], ['u32', 0], ['u32', 0], ['u32', 0]]);
+  const swigluParams = packUniform(ctx, [['u32', ffn], ['u32', 0], ['u32', 0], ['u32', 0]]);
+  const ropeParams = packUniform(ctx, [['u32', 1], ['u32', config.numHeads], ['u32', config.headDim], ['u32', 0]]);
+  const attnParams = packUniform(ctx, [
+    ['u32', 1], ['u32', total - 1], ['u32', config.numHeads], ['u32', config.numKVHeads],
+    ['u32', config.headDim], ['u32', config.kvGroupSize], ['u32', total], ['u32', 0],
+  ]);
+  const mvParams = (rows, cols, bias) => {
+    const { width } = grid2d(rows);
+    return packUniform(ctx, [['u32', rows], ['u32', cols], ['u32', bias ? 1 : 0], ['u32', width]]);
+  };
+
+  const KERNELS = [
+    { name: 'rmsnorm', per: 2, run: (e, n, ts) => ctx.encodeRepeated(e, RMSNORM, [scratchX, w0.inputNorm, scratchN, normParams], [1], n, ts) },
+    { name: 'q_proj  (896x896)', per: 1, run: (e, n, ts) => ctx.encodeRepeated(e, MATVEC, [w0.wq, scratchN, w0.bq, scratchQ, mvParams(d, d, true)], [...grid2d(d).grid, 1], n, ts) },
+    { name: 'k_proj  (128x896)', per: 1, run: (e, n, ts) => ctx.encodeRepeated(e, MATVEC, [w0.wk, scratchN, w0.bk, scratchKV, mvParams(kvDim, d, true)], [...grid2d(kvDim).grid, 1], n, ts) },
+    { name: 'o_proj  (896x896)', per: 1, run: (e, n, ts) => ctx.encodeRepeated(e, MATVEC, [w0.wo, scratchQ, noBias, scratchX, mvParams(d, d, false)], [...grid2d(d).grid, 1], n, ts) },
+    { name: 'gate/up (4864x896)', per: 2, run: (e, n, ts) => ctx.encodeRepeated(e, MATVEC, [w0.wGate, scratchN, noBias, scratchFfn, mvParams(ffn, d, false)], [...grid2d(ffn).grid, 1], n, ts) },
+    { name: 'down    (896x4864)', per: 1, run: (e, n, ts) => ctx.encodeRepeated(e, MATVEC, [w0.wDown, scratchFfn, noBias, scratchX, mvParams(d, ffn, false)], [...grid2d(d).grid, 1], n, ts) },
+    { name: 'rope', per: 2, run: (e, n, ts) => ctx.encodeRepeated(e, ROPE, [scratchQ, model.ropeTable.cos, model.ropeTable.sin, ropeParams], [Math.ceil(config.numHeads * config.headDim / 2 / 64)], n, ts) },
+    { name: 'attention', per: 1, run: (e, n, ts) => ctx.encodeRepeated(e, ATTENTION, [scratchQ, prefillCache.keys[0], prefillCache.values[0], scratchX, scores, attnParams], [1, config.numHeads], n, ts) },
+    { name: 'swiglu', per: 1, run: (e, n, ts) => ctx.encodeRepeated(e, SWIGLU, [scratchFfn, scratchFfn2, swigluParams], [Math.ceil(ffn / GROUP)], n, ts) },
+    { name: 'residual add', per: 2, run: (e, n, ts) => ctx.encodeRepeated(e, ADD, [scratchX, scratchN, addParams], [Math.ceil(d / GROUP)], n, ts) },
+  ];
+
+  // Three rounds per kernel, reporting the median and the spread. A first pass
+  // at this reported a single reading, and a later run disagreed with it by a
+  // factor of four on the same kernel with the same code -- this is an
+  // integrated GPU allocating from system memory on a machine with about a
+  // gigabyte free, so residency, not arithmetic, sets the time. A point
+  // estimate here would be fiction.
+  const ROUNDS = 3;
+  const perKernel = [];
+  const rawTotals = [];
+  for (const kernel of KERNELS) {
+    const rounds = [];
+    for (let r = 0; r < ROUNDS; r++) {
+      const [totalNs] = await ctx.timed(1, (e, i, ts) => kernel.run(e, REPEATS, ts));
+      rawTotals.push(totalNs);
+      rounds.push(totalNs / REPEATS);
+    }
+    const ns = median(rounds);
+    perKernel.push({
+      name: kernel.name, ns, rounds,
+      lo: Math.min(...rounds), hi: Math.max(...rounds),
+      perLayer: ns * kernel.per,
+    });
+  }
+
+  // The output projection runs once per token, not once per layer, and is big
+  // enough that fewer repeats already clear the clock's granularity.
+  const LM_REPEATS = 32;
+  const lmParams = packUniform(ctx,
+    [['u32', config.vocabSize], ['u32', d], ['u32', 0], ['u32', grid2d(config.vocabSize).width]]);
+  const lmRounds = [];
+  let lmTotal = 0;
+  for (let r = 0; r < ROUNDS; r++) {
+    const [total] = await ctx.timed(1, (e, _i, ts) => {
+      ctx.encodeRepeated(e, MATVEC, [model.w.embed, scratchN, noBias, scratchLogits, lmParams],
+        [...grid2d(config.vocabSize).grid, 1], LM_REPEATS, ts, 'lm_head');
+    });
+    lmTotal = total;
+    lmRounds.push(total / LM_REPEATS);
+  }
+  const lmNs = median(lmRounds);
+
+  // The browser coarsens the GPU clock. Rather than probe it with a synthetic
+  // kernel, read it off the measurements just taken: if every raw pass total is
+  // a multiple of some quantum, their greatest common divisor is it.
+  const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b));
+  const quantum = [...rawTotals, lmTotal].filter((v) => v > 0).reduce((a, b) => gcd(a, b), 0);
+
+  sections.push(`<h2>The clock</h2>
+    <p class="lede">GPU timestamps are deliberately coarsened by the browser. Every raw pass
+    total measured below is a multiple of <b>${(quantum / 1000).toFixed(1)} us</b>, which is
+    the quantum this adapter reports through Chrome. Every kernel here runs in far less than
+    that, so timing a single dispatch would read as either zero or one whole quantum and
+    neither would be the answer. Each kernel is therefore timed as ${REPEATS} dispatches
+    inside one pass and divided down, which brings the quantisation error to about
+    ${(quantum / 1000 / REPEATS).toFixed(2)} us per call.</p>`);
+
+  // The logits come back to the CPU every token: 151936 floats, 608 KB, through
+  // a mapAsync that waits for the GPU. Batching the dispatches did not move the
+  // decode time, so this is the next suspect and it is worth timing rather than
+  // assuming.
+  const readbackMs = [];
+  for (let r = 0; r < 5; r++) {
+    const r0 = performance.now();
+    await ctx.readF32(scratchLogits, config.vocabSize);
+    readbackMs.push(performance.now() - r0);
+  }
+  const readback = median(readbackMs);
+
+  const layerNs = perKernel.reduce((a, k) => a + k.perLayer, 0);
+  const modelNs = layerNs * config.numLayers + lmNs;
+  const accountedMs = modelNs / 1e6;
+
+  const maxShare = Math.max(...perKernel.map((k) => k.perLayer * config.numLayers), lmNs);
+  const rowFor = (name, ns, note) => `<tr>
+      <td>${name}</td>
+      <td class="num">${(ns / 1000).toFixed(1)} us</td>
+      <td class="num">${((ns / modelNs) * 100).toFixed(1)}%</td>
+      <td><span class="bar" style="width:${Math.max(1, (ns / maxShare) * 220)}px"></span></td>
+      <td>${note}</td></tr>`;
+
+  sections.push(`<h2>Where a decode step goes</h2>
+    <p class="lede">GPU time per kernel, measured over ${REPEATS} dispatches and divided
+    down, then multiplied by how many times each runs in a full pass.</p>
+    <table>
+      <tr><th>kernel</th><th>per token</th><th>share</th><th></th><th></th></tr>
+      ${perKernel.map((k) => rowFor(k.name, k.perLayer * config.numLayers,
+        `x${k.per} per layer &times; ${config.numLayers}; rounds ` +
+        `${k.rounds.map((v) => (v / 1000).toFixed(0)).join('/')} us`)).join('')}
+      ${rowFor('lm_head (151936x896)', lmNs, 'once per token')}
+    </table>
+    <table>
+      <tr><td>GPU time accounted for</td><td class="num">${accountedMs.toFixed(1)} ms</td></tr>
+      <tr><td>measured decode step</td><td class="num">${medianStep.toFixed(1)} ms</td></tr>
+      <tr><td>logits readback to the CPU (608 KB)</td>
+          <td class="num">${readback.toFixed(1)} ms</td></tr>
+      <tr><td><b>unaccounted for</b></td>
+          <td class="num"><b>${(medianStep - accountedMs - readback).toFixed(1)} ms
+          (${(((medianStep - accountedMs - readback) / medianStep) * 100).toFixed(0)}%)</b></td></tr>
+    </table>
+    <p class="lede">Both columns move between runs by as much as a factor of four, because
+    this is an integrated GPU allocating from system memory on a machine with about a
+    gigabyte free: what is resident when a kernel runs matters more than what the kernel
+    does. The per-round figures above show the spread rather than hiding it.</p>
+    <p class="lede">The gap is not arithmetic. A decode step submits roughly
+    ${(perKernel.reduce((a, k) => a + k.per, 0) * config.numLayers + 1)} dispatches plus a
+    buffer readback of ${(config.vocabSize * 4 / 1e6).toFixed(1)} MB, and every one of those
+    crosses into the driver. That is what an unfused engine costs.</p>`);
+  show();
+
+  window.__bench = {
+    quantumNs: quantum, rawTotals,
+    ttftMs: ttft, promptTokens: ids.length,
+    decodeMedianMs: medianStep, decodeSteps: stepMs, ttftRuns,
+    perKernel, lmNs, lmRounds, accountedMs, readbackMs: readback,
+    submissions: ctx.submissions,
+    adapter: ctx.describe(),
+  };
+  window.__done = true;
+  say('done');
+} catch (error) {
+  window.__done = true;
+  window.__error = String(error) + '\n' + (error.stack ?? '');
+  log.innerHTML = `<span style="color:#b00">${String(error)}</span>`;
+  out.innerHTML = `<pre>${error.stack ?? ''}</pre>`;
+}
+</script>
