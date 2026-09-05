@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-inference-webgpu</title>
+<style>
+  :root {
+    --ink: #16171b; --dim: #5c6068; --faint: #8b9099; --line: #e3e5e9; --bg: #fbfbfc;
+    --card: #ffffff; --accent: #3b5bdb; --good: #15803d; --warn: #b45309;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ink: #e7e9ee; --dim: #9aa1ab; --faint: #767c86; --line: #2a2d34; --bg: #131418;
+      --card: #191b20; --accent: #91a7ff; --good: #4ade80; --warn: #fbbf24;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  main { max-width: 56rem; margin: 0 auto; padding: 3.5rem 1.5rem 6rem; }
+  h1 { font-size: 1.6rem; line-height: 1.25; margin: 0 0 0.5rem; letter-spacing: -0.015em; }
+  h2 { font-size: 0.82rem; margin: 3rem 0 0.8rem; color: var(--faint);
+       text-transform: uppercase; letter-spacing: 0.11em; font-weight: 500; }
+  h3 { font-size: 1rem; margin: 1.8rem 0 0.4rem; }
+  p { max-width: 46rem; }
+  .sub { color: var(--dim); margin-top: 0; }
+  a { color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 1.1rem 1.25rem; margin: 1rem 0; }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  th { text-align: left; font-weight: 500; color: var(--faint); padding: 0.3rem 1.2rem 0.5rem 0;
+       border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 0.32rem 1.2rem 0.32rem 0; border-bottom: 1px solid var(--line);
+       vertical-align: top; }
+  td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .good { color: var(--good); } .warn { color: var(--warn); }
+  .claims td:first-child { color: var(--dim); }
+  .links { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.4rem; }
+  .links a { display: inline-block; padding: 0.4rem 0.8rem; border: 1px solid var(--line);
+             border-radius: 7px; text-decoration: none; background: var(--card); }
+  .links a b { color: var(--ink); }
+  .links a span { color: var(--faint); font-size: 0.82rem; }
+  .lead { border-left: 3px solid var(--accent); }
+  footer { margin-top: 4rem; color: var(--faint); font-size: 0.82rem; }
+  .bar { display: inline-block; height: 8px; background: var(--accent); border-radius: 2px;
+         vertical-align: middle; }
+</style>
+<main>
+  <h1>A transformer inference engine, written from scratch</h1>
+  <p class="sub">Qwen2.5-0.5B-Instruct, running on WebGPU. No PyTorch, no transformers, no
+  tokenizer library: the safetensors reader, the bfloat16 conversion, the BPE tokenizer, the
+  KV cache, the attention kernels and the quantization are all in
+  <a href="https://github.com/abho7/llm-inference-webgpu">the repository</a>.</p>
+
+  <div class="card lead">
+    <p style="margin:0">Generating plausible text proves nothing; the reference
+    implementations already do that. Every claim below is checked against an independent
+    implementation or measured on named hardware, and the ones that went against me are
+    here too.</p>
+  </div>
+
+  <div class="links">
+    <a href="web/demo.html"><b>Live demo</b> <span>&mdash; runs in your browser (988 MB)</span></a>
+    <a href="https://github.com/abho7/llm-inference-webgpu"><b>Source</b> <span>&mdash; GitHub</span></a>
+    <a href="web/bench.html"><b>Benchmark</b> <span>&mdash; throughput, per-kernel</span></a>
+    <a href="web/kernels.html"><b>Kernels</b> <span>&mdash; GPU vs CPU</span></a>
+    <a href="web/model.html"><b>Model</b> <span>&mdash; GPU vs ONNX oracle</span></a>
+    <a href="web/perplexity.html"><b>Perplexity</b> <span>&mdash; per quantization scheme</span></a>
+    <a href="web/precision.html"><b>Precision</b> <span>&mdash; adapter transcendentals</span></a>
+  </div>
+
+  <div id="report">Loading measurements&hellip;</div>
+
+  <footer id="hardware"></footer>
+</main>
+
+<script type="module">
+const report = document.getElementById('report');
+
+const esc = (s) => String(s).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+const exp = (v) => (v === 0 ? '0' : Number(v).toExponential(2));
+
+try {
+  const m = await (await fetch('golden/measurements.json')).json();
+  const parts = [];
+
+  // ------------------------------------------------------------- the claims --
+  parts.push(`<h2>What is actually established</h2>
+  <div class="wrap"><table class="claims">
+    <tr><th>claim</th><th>measured</th><th>checked against</th></tr>
+    <tr><td>Weights load bit-exactly</td>
+        <td class="n good">${m.phase0.digestsCompared} digests, 0 differ</td>
+        <td>an independent NumPy parse</td></tr>
+    <tr><td>Tokenization is identical</td>
+        <td class="n good">${m.phase0.tokenizerCases.toLocaleString()} cases, 0 differ</td>
+        <td>Hugging Face tokenizers (Rust)</td></tr>
+    <tr><td>Forward pass agrees per layer</td>
+        <td class="n">${exp(m.phase1.worstPerLayerRelative)} relative</td>
+        <td>ONNX Runtime fp32, 48 tensors per prompt</td></tr>
+    <tr><td>KV cache changes nothing</td>
+        <td class="n good">${m.phase2.differingFloats} floats differ</td>
+        <td>full recomputation, bit for bit</td></tr>
+    <tr><td>GPU agrees with the oracle</td>
+        <td class="n">${exp(m.phase3.gpuVsOracleWorstPerLayerRelative)} relative</td>
+        <td>ONNX Runtime fp32, per layer</td></tr>
+    <tr><td>Same next token as the oracle</td>
+        <td class="n good">${m.phase3.gpuArgmaxAgreement}</td>
+        <td>argmax, no tolerance allowed</td></tr>
+  </table></div>`);
+
+  // ------------------------------------------------------------ performance --
+  const e = m.phase5.engine;
+  const o = m.phase5.onnxRuntimeCpu;
+  parts.push(`<h2>Speed, against a real inference runtime</h2>
+  <p>The baseline is ONNX Runtime on this machine's CPU running the same model. It wins.</p>
+  <div class="wrap"><table>
+    <tr><th></th><th class="n">this engine</th><th class="n">ONNX Runtime</th><th class="n">ratio</th></tr>
+    <tr><td>prefill, ${e.prefillTokens}-token prompt</td>
+        <td class="n">${e.prefillTokensPerSecond} tok/s</td>
+        <td class="n">${o.prefillTokensPerSecond} tok/s</td>
+        <td class="n warn">ORT ${(o.prefillTokensPerSecond / e.prefillTokensPerSecond).toFixed(1)}x</td></tr>
+    <tr><td>decode, median step</td>
+        <td class="n">${e.decodeTokensPerSecond} tok/s</td>
+        <td class="n">${o.decodeTokensPerSecond} tok/s</td>
+        <td class="n warn">ORT ${(o.decodeTokensPerSecond / e.decodeTokensPerSecond).toFixed(1)}x</td></tr>
+  </table></div>
+  <p style="color:var(--dim);font-size:0.86rem">Decode varied from
+  ${e.decodeRangeAcrossRunsMs[0]} to ${e.decodeRangeAcrossRunsMs[1]} ms across runs on a
+  shared integrated GPU; the faster figure is quoted above and the range here. The ONNX
+  figure is itself a lower bound: ${esc(o.caveat)}.</p>`);
+
+  const per = Object.entries(m.phase5.perTokenGpuMs);
+  const peak = Math.max(...per.map(([, v]) => v));
+  const totalGpu = per.reduce((a, [, v]) => a + v, 0);
+  parts.push(`<h3>Where a decode step goes</h3>
+  <div class="wrap"><table>
+    <tr><th>kernel</th><th class="n">per token</th><th class="n">share</th><th></th></tr>
+    ${per.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v.toFixed(2)} ms</td>
+      <td class="n">${((v / totalGpu) * 100).toFixed(0)}%</td>
+      <td><span class="bar" style="width:${Math.max(2, (v / peak) * 200)}px"></span></td></tr>`).join('')}
+    <tr><td>logits readback, 608 KB</td><td class="n">${e.logitsReadbackMs} ms</td><td></td><td></td></tr>
+    <tr><td><b>unaccounted</b></td>
+        <td class="n"><b>${(e.decodeMedianMs - e.accountedGpuMs - e.logitsReadbackMs).toFixed(1)} ms</b></td>
+        <td class="n"><b>${(((e.decodeMedianMs - e.accountedGpuMs - e.logitsReadbackMs) / e.decodeMedianMs) * 100).toFixed(0)}% of the step</b></td>
+        <td></td></tr>
+  </table></div>`);
+
+  // ---------------------------------------------------------- quantization --
+  const q = m.phase4;
+  parts.push(`<h2>What quantization costs</h2>
+  <div class="wrap"><table>
+    <tr><th>weights</th><th class="n">bits</th><th class="n">size</th><th class="n">perplexity</th>
+        <th class="n">vs f16, paired</th><th class="n">oracle argmax</th></tr>
+    <tr><td>f16</td><td class="n">${q.bitsPerWeight.f16}</td><td class="n">${q.modelSizeMB.f16} MB</td>
+        <td class="n">${q.perplexity.f16.toFixed(2)}</td><td class="n">baseline</td>
+        <td class="n good">${q.argmaxAgreement.f16}</td></tr>
+    <tr><td>int8, per channel</td><td class="n">${q.bitsPerWeight.int8}</td>
+        <td class="n">${q.modelSizeMB.int8} MB</td>
+        <td class="n">${q.perplexity.int8.toFixed(2)}</td>
+        <td class="n">${q.perplexity.int8PairedMeanNllDelta.toFixed(4)} &plusmn; ${q.perplexity.int8PairedStandardError.toFixed(4)}</td>
+        <td class="n">${q.argmaxAgreement.int8}</td></tr>
+    <tr><td>int4, groups of 128</td><td class="n">${q.bitsPerWeight['int4-g128']}</td>
+        <td class="n">${q.modelSizeMB['int4-g128']} MB</td>
+        <td class="n warn">${q.perplexity['int4-g128'].toFixed(2)}</td>
+        <td class="n warn">+${q.perplexity.int4PairedMeanNllDelta.toFixed(4)} &plusmn; ${q.perplexity.int4PairedStandardError.toFixed(4)}</td>
+        <td class="n warn">${q.argmaxAgreement['int4-g128']}</td></tr>
+  </table></div>
+  <p>int8 came out <em>lower</em> than f16, and the paired test is what stops that becoming a
+  claim: at ${Math.abs(q.perplexity.int8PairedMeanNllDelta / q.perplexity.int8PairedStandardError).toFixed(1)}
+  standard errors it is noise. The honest statement is that int8 does not measurably hurt
+  this model, not that it helps it. int4 loses
+  ${q.perplexity.int4PairedMeanNllDelta.toFixed(2)} nats per token and changes the predicted
+  token on two of five prompts.</p>`);
+
+  // ---------------------------------------------------- things I got wrong --
+  parts.push(`<h2>Three things that went against me</h2>
+
+  <h3>The outlier channel was not the problem</h3>
+  <p>Phase 1 found channel 490 growing to 27 times the RMS of the hidden state, and I wrote
+  that outlier channels like it are what makes quantization fail. Measuring it said
+  otherwise: the damage is concentrated, but channel 490 is almost never the culprit,
+  because at every layer past the first it has the <em>smallest</em> normalisation gain of
+  all 896 channels &mdash; rank ${q.damageConcentration.channel490NormGainRankOf896} of 896.
+  The model makes that channel massive in the residual stream and suppresses it before any
+  projection reads it. Weight-only quantization never touches the residual stream.</p>
+
+  <h3>Batching 400 submissions into one did not help</h3>
+  <p>Half a decode step sat outside the kernels, and the obvious culprit was submission
+  overhead: a command buffer per dispatch, about 400 per token. Batching the whole forward
+  pass into one took that to ${e.submissionsPerForward}, and decode did not measurably
+  improve. The change stays, because 400 submissions per token is indefensible either way,
+  but submission count was not the bottleneck &mdash; and I would have claimed it was if I
+  had shipped the optimisation without re-measuring.</p>
+
+  <h3>The GPU cannot compute a rotation accurately enough</h3>
+  <p>The rotary embedding kernel failed at ${exp(m.phase3.ropeBeforeTables)} while every
+  other kernel passed at 1e-7. Measuring this adapter's transcendentals rather than guessing
+  showed sin and cos carrying about
+  ${exp(m.phase3.adapterTranscendentalErrorAbs.cos_within_one_turn)} of absolute error even
+  within a single turn, while pow was fine. So the cosines and sines are computed once on the
+  CPU in f64 and uploaded as a table; the kernel went to
+  ${exp(m.phase3.ropeAfterTables)}, a factor of 250.</p>`);
+
+  report.innerHTML = parts.join('');
+
+  const h = m.hardware;
+  document.getElementById('hardware').innerHTML =
+    `Every number on this page was produced by a script or harness in the repository, listed
+     in <code>golden/measurements.json</code> beside the figure it produced.<br><br>
+     Measured on ${esc(h.cpu)}, ${esc(h.gpu)}, ${esc(h.ram)}. The adapter reports
+     ${h.adapterFeatures.map(esc).join(', ')} and coarsens GPU timestamps to a
+     ${h.timestampQuantumUs} us quantum.`;
+} catch (error) {
+  report.innerHTML = `<p class="warn">Could not load measurements: ${esc(error)}</p>`;
+}
+</script>
+</html>

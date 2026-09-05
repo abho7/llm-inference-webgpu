@@ -1,0 +1,138 @@
+{
+ "note": "Every number this project reports, with the thing that produced it. Figures marked browser were read from a run of the named page on the hardware below; figures marked node are reproducible by running the named script.",
+ "hardware": {
+  "cpu": "Intel Core i7-1355U, 10 cores / 12 threads",
+  "ram": "16 GB, roughly 1.3 GB free during the GPU runs",
+  "gpu": "Intel Iris Xe (gen-12lp), integrated, memory shared with the system",
+  "adapterFeatures": ["shader-f16", "subgroups", "timestamp-query", "float32-filterable"],
+  "timestampQuantumUs": 65.54,
+  "browser": "Chrome, WebGPU",
+  "node": "24.18.0"
+ },
+ "model": {
+  "name": "Qwen/Qwen2.5-0.5B-Instruct",
+  "parameters": 494032768,
+  "tensors": 290,
+  "layers": 24,
+  "hiddenSize": 896,
+  "queryHeads": 14,
+  "kvHeads": 2,
+  "storedDtype": "bfloat16",
+  "tiedEmbeddings": true
+ },
+ "phase0": {
+  "producedBy": "node --test, oracle/tensor_digest.py, oracle/tokenize_corpus.py",
+  "tensorsBitExact": 290,
+  "digestsCompared": 580,
+  "tokenizerCases": 3098,
+  "tokenizerTokens": 85633,
+  "tokenizerDifferences": 0,
+  "residentMemoryMB": 52,
+  "modelSizeMB": 988
+ },
+ "phase1": {
+  "producedBy": "validate/phase1.js against golden/reference (ONNX Runtime fp32)",
+  "worstPerLayerRelative": 9.14e-5,
+  "worstLogitRelative": 6.64e-6,
+  "perLayerBound": 5e-4,
+  "logitBound": 1e-4,
+  "argmaxAgreement": "5/5",
+  "top10Agreement": "5/5",
+  "uncachedGenerationTokensPerSecond": 0.06
+ },
+ "phase2": {
+  "producedBy": "validate/phase2.js",
+  "splitsChecked": 3,
+  "differingFloats": 0,
+  "cachedTokensPerSecond": 0.17,
+  "uncachedTokensPerSecond": 0.05,
+  "speedup": 3.59,
+  "cacheBytesFor2048Positions": 50331648
+ },
+ "phase3": {
+  "producedBy": "web/kernels.html, web/precision.html, web/model.html",
+  "kernelsVsCpuRelative": {
+   "matvec-896x896": 1.08e-7,
+   "matvec-151936x32": 9.43e-8,
+   "rmsnorm": 7.13e-8,
+   "rope": 8.97e-8,
+   "attention": 1.64e-7,
+   "swiglu": 8.58e-8,
+   "add": 0
+  },
+  "ropeBeforeTables": 2.22e-5,
+  "ropeAfterTables": 8.97e-8,
+  "adapterTranscendentalErrorAbs": {
+   "cos_large_angles": 5.29e-5,
+   "sin_large_angles": 5.9e-5,
+   "cos_within_one_turn": 3.03e-5,
+   "sin_within_one_turn": 3.03e-5,
+   "pow": 1.37e-8
+  },
+  "gpuVsOracleWorstPerLayerRelative": 6.43e-5,
+  "gpuVsOracleWorstLogitRelative": 4.74e-6,
+  "gpuArgmaxAgreement": "5/5",
+  "f16WeightsChanged": 123027,
+  "f16WeightsFlushedToZero": 1463,
+  "f16WorstRelativeChangeInNormalRange": 0
+ },
+ "phase4": {
+  "producedBy": "validate/quantization-error.js, validate/quantization-outliers.js, validate/perplexity.js",
+  "frobeniusByScheme": {
+   "f16": 2.0e-8,
+   "int8": 1.0e-2,
+   "int4-g128": 1.1e-1,
+   "int4-g64": 9.6e-2,
+   "int4-g32": 8.4e-2
+  },
+  "bitsPerWeight": { "f16": 16, "int8": 8.036, "int4-g128": 4.5, "int4-g32": 6.0 },
+  "modelSizeMB": { "f16": 988, "int8": 496, "int4-g128": 278, "int4-g32": 371 },
+  "perplexity": {
+   "protocol": "fixed passage, full left context, no stride, nothing scored twice, 47 positions",
+   "f16": 14.7064,
+   "int8": 14.6507,
+   "int4-g128": 22.2829,
+   "int8PairedMeanNllDelta": -0.0038,
+   "int8PairedStandardError": 0.0136,
+   "int4PairedMeanNllDelta": 0.4155,
+   "int4PairedStandardError": 0.1668
+  },
+  "argmaxAgreement": { "f16": "5/5", "int8": "4/5", "int4-g128": "3/5" },
+  "damageConcentration": {
+   "evenSharePercent": 0.112,
+   "worstSingleChannelPercent": 2.3,
+   "channel490NormGainRankOf896": 896
+  }
+ },
+ "phase5": {
+  "producedBy": "web/bench.html and oracle/bench_ort.py",
+  "engine": {
+   "prefillMs": 1233,
+   "prefillTokens": 52,
+   "prefillTokensPerSecond": 42,
+   "decodeMedianMs": 86.8,
+   "decodeTokensPerSecond": 11.5,
+   "decodeRangeAcrossRunsMs": [86.8, 175.1],
+   "accountedGpuMs": 36.5,
+   "logitsReadbackMs": 5.8,
+   "submissionsPerForward": 1
+  },
+  "onnxRuntimeCpu": {
+   "prefillMs": 218.3,
+   "prefillTokens": 52,
+   "prefillTokensPerSecond": 238,
+   "decodeMedianMs": 67.5,
+   "decodeTokensPerSecond": 14.8,
+   "caveat": "it passes the past keys and values as ordinary tensors, so every step copies the whole cache in and out"
+  },
+  "perTokenGpuMs": {
+   "gate/up (4864x896, twice per layer)": 14.72,
+   "lm_head (151936x896, once per token)": 9.05,
+   "down (896x4864)": 5.92,
+   "attention": 1.98,
+   "o_proj (896x896)": 1.94,
+   "q_proj (896x896)": 1.87,
+   "rmsnorm, k_proj, rope, swiglu, add": 1.01
+  }
+ }
+}

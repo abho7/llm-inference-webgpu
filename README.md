@@ -9,10 +9,15 @@ No PyTorch, no `transformers`, no tokenizer library. The safetensors container,
 the bfloat16 conversion, the BPE tokenizer, the attention kernels and the
 quantization are all in this repository.
 
-> **Status: Phase 5 of 6.** The model runs on the GPU, agrees with ONNX Runtime
-> per layer, quantizes to 8 and 4 bits with the damage measured, and has now
-> been benchmarked against a real inference runtime -- which beats it. By how
-> much, and where the time actually goes, is below.
+> **Status: all six phases done.** The engine loads the weights, tokenizes
+> exactly, agrees with ONNX Runtime per layer, caches keys and values without
+> changing a bit, runs on the GPU, quantizes to 8 and 4 bits with the damage
+> measured, loses to ONNX Runtime by a measured margin, and is deployed.
+>
+> **[Live demo](https://abho7.github.io/llm-inference-webgpu/web/demo.html)** --
+> runs in your browser, streaming the weights from Hugging Face.
+> **[Report](https://abho7.github.io/llm-inference-webgpu/)** -- every number,
+> with what produced it.
 
 ## What this sets out to prove
 
@@ -28,6 +33,35 @@ already do that. The claims worth making are narrower and checkable:
 | 5 | The WebGPU backend matches the CPU reference within f16 tolerance | 3 | **done** |
 | 6 | Quantization error is characterised per layer, not just end to end | 4 | **done** |
 | 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | **done** |
+| 8 | It runs, in public, in someone else's browser | 6 | **done** |
+
+## Phase 6: deployed
+
+Two pages, both on GitHub Pages, both running the same source the tests run
+against -- there is no build step and nothing is bundled.
+
+**[The demo](https://abho7.github.io/llm-inference-webgpu/web/demo.html)** runs
+the model in your browser. Nothing is served from the site but code: the weights
+stream directly from Hugging Face over HTTP range requests, which works because
+the CDN answers a cross-origin ranged request with a 206 and
+`access-control-allow-origin: *`. That was checked before anything was built on
+it, because the whole approach depends on it.
+
+The cost is stated on the page before you can start it: **988 MB of weights**,
+about a gigabyte of GPU-accessible memory, and WebGPU with `shader-f16`. Nothing
+is fetched until you ask for it. On this machine the download and upload take
+about 135 seconds, once.
+
+**[The report](https://abho7.github.io/llm-inference-webgpu/)** renders from
+`golden/measurements.json`, which records every figure this project quotes
+alongside the script or harness that produced it. No number on that page is
+typed into the HTML.
+
+`src/core/source-web.js` probes with a one-byte range request rather than a
+HEAD. A HEAD gives the length but not whether ranges work, and Hugging Face
+redirects to a CDN, so the headers that matter belong to a different host than
+the one you asked. If a server ever answers a range with a 200, the loader
+refuses rather than quietly downloading a gigabyte to read eight bytes.
 
 ## Phase 5: how fast it is, and losing to ONNX Runtime
 
