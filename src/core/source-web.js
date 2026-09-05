@@ -16,19 +16,35 @@ export class FetchSource {
   }
 
   /**
-   * Learn the resource's length, and refuse to continue if the server will not
-   * serve ranges -- silently downloading 988 MB is worse than failing.
+   * Learn the resource's length and confirm it will serve ranges.
+   *
+   * Done with a one-byte range request rather than a HEAD. A HEAD tells you
+   * the length but not whether ranges actually work, and content delivery
+   * networks routinely answer the two differently -- Hugging Face redirects
+   * this file to a CDN, so the headers that matter are the CDN's, not the
+   * ones the original host advertises. Asking for one byte gets the real
+   * answer from the server that will serve the rest: a 206 and a Content-Range
+   * whose total is the length.
    */
   static async open(url) {
-    const head = await fetch(url, { method: 'HEAD' });
-    if (!head.ok) throw new Error(`HEAD ${url}: ${head.status} ${head.statusText}`);
+    const response = await fetch(url, { headers: { Range: 'bytes=0-0' } });
+    if (!response.ok) throw new Error(`${url}: ${response.status} ${response.statusText}`);
 
-    const length = head.headers.get('content-length');
-    if (length === null) throw new Error(`${url}: no content-length`);
-    if ((head.headers.get('accept-ranges') ?? '').toLowerCase() !== 'bytes') {
-      throw new Error(`${url}: server does not advertise byte ranges`);
+    if (response.status !== 206) {
+      // A 200 here means the server ignored the range and is sending the whole
+      // file. Continuing would download a gigabyte to read eight bytes.
+      throw new Error(
+        `${url}: server ignored a range request (status ${response.status}), `
+        + 'so reading this file would download all of it',
+      );
     }
-    return new FetchSource(url, Number(length));
+    const range = response.headers.get('content-range');
+    const match = /\/\s*(\d+)\s*$/.exec(range ?? '');
+    if (!match) throw new Error(`${url}: no usable Content-Range (${range})`);
+
+    // Drain the one byte so the connection can be reused.
+    await response.arrayBuffer();
+    return new FetchSource(url, Number(match[1]));
   }
 
   async size() { return this.#size; }

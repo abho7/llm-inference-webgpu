@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen2.5-0.5B, from scratch, in your browser</title>
+<style>
+  :root {
+    --ink: #16171b; --dim: #5c6068; --line: #e2e4e8; --bg: #fbfbfc;
+    --card: #ffffff; --accent: #3b5bdb; --warn: #b45309; --ok: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ink: #e7e9ee; --dim: #9aa1ab; --line: #2a2d34; --bg: #131418;
+      --card: #191b20; --accent: #91a7ff; --warn: #fbbf24; --ok: #4ade80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  main { max-width: 54rem; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+  h1 { font-size: 1.5rem; line-height: 1.3; margin: 0 0 0.4rem; letter-spacing: -0.01em; }
+  h2 { font-size: 1rem; margin: 2.5rem 0 0.6rem; color: var(--dim);
+       text-transform: uppercase; letter-spacing: 0.09em; font-weight: 500; }
+  p { max-width: 44rem; }
+  .sub { color: var(--dim); margin-top: 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 1.2rem 1.3rem; margin: 1.2rem 0; }
+  .cost { border-left: 3px solid var(--warn); }
+  .cost b { color: var(--warn); }
+  button { font: inherit; font-size: 0.95rem; padding: 0.55rem 1.1rem; border-radius: 7px;
+           border: 1px solid var(--accent); background: var(--accent); color: #fff;
+           cursor: pointer; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.ghost { background: transparent; color: var(--accent); }
+  textarea { width: 100%; font: inherit; font-size: 0.92rem; padding: 0.7rem;
+             border: 1px solid var(--line); border-radius: 7px; background: var(--card);
+             color: var(--ink); resize: vertical; }
+  .row { display: flex; gap: 0.7rem; align-items: center; flex-wrap: wrap; margin-top: 0.8rem; }
+  progress { width: 100%; height: 6px; accent-color: var(--accent); }
+  #status { color: var(--dim); font-size: 0.86rem; min-height: 1.4em; }
+  #outputCard { display: none; }
+  #output { white-space: pre-wrap; word-break: break-word; min-height: 4rem; }
+  #output .prompt { color: var(--dim); }
+  #output .gen { color: var(--ink); }
+  #cursor { display: inline-block; width: 0.55em; height: 1em; background: var(--accent);
+            vertical-align: text-bottom; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { #cursor { animation: none; } }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  td { padding: 0.25rem 1rem 0.25rem 0; border-bottom: 1px solid var(--line); }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); }
+  a { color: var(--accent); }
+  code { font-size: 0.9em; }
+  .fail { color: var(--warn); }
+</style>
+<main>
+  <h1>Qwen2.5-0.5B, running in your browser</h1>
+  <p class="sub">No PyTorch, no transformers, no tokenizer library. The safetensors reader,
+  the bfloat16 conversion, the BPE tokenizer, the KV cache and the WebGPU kernels are all in
+  <a href="https://github.com/abho7/llm-inference-webgpu">this repository</a>. The weights
+  stream straight from Hugging Face; nothing is served from here but the code.</p>
+
+  <div class="card cost">
+    <p style="margin-top:0">Before you press start, the honest cost: this downloads
+    <b>988 MB of weights</b> and uploads them to your GPU. On a fast connection that is a
+    minute or two, and it needs roughly <b>1 GB of free GPU-accessible memory</b>. Nothing is
+    fetched until you ask for it.</p>
+    <p style="margin-bottom:0">It needs WebGPU with the <code>shader-f16</code> feature.
+    Chrome and Edge 121+ on desktop have it; Safari and Firefox mostly do not yet.</p>
+  </div>
+
+  <div class="card">
+    <label for="prompt" style="color:var(--dim);font-size:0.86rem">Prompt</label>
+    <textarea id="prompt" rows="3">The capital of France is</textarea>
+    <div class="row">
+      <button id="go">Load the model and generate</button>
+      <label style="color:var(--dim);font-size:0.86rem">
+        <input type="number" id="count" value="48" min="1" max="256" style="width:4.5rem;
+        font:inherit;padding:0.3rem;border:1px solid var(--line);border-radius:5px;
+        background:var(--card);color:var(--ink)"> tokens
+      </label>
+    </div>
+    <div class="row" style="display:block">
+      <progress id="bar" value="0" max="1" hidden></progress>
+      <div id="status">Idle.</div>
+    </div>
+  </div>
+
+  <div class="card" id="outputCard">
+    <div id="output"></div>
+  </div>
+
+  <div class="card" id="statsCard" hidden>
+    <h2 style="margin-top:0">This run</h2>
+    <table id="stats"></table>
+  </div>
+
+  <h2>What this is</h2>
+  <p>A transformer inference engine written from scratch, with every correctness claim
+  checked against an independent implementation rather than asserted. The engine agrees with
+  ONNX Runtime per layer to 6.4e-5 relative and picks the same next token on every test
+  prompt; incremental decoding with the KV cache is bit-identical to full recomputation; and
+  it is slower than ONNX Runtime, by 1.3x on decode and 5.6x on prefill, which the
+  <a href="https://github.com/abho7/llm-inference-webgpu#phase-5-how-fast-it-is-and-losing-to-onnx-runtime">README
+  measures and explains</a>.</p>
+
+<script type="module">
+import { GpuContext } from '../src/gpu/device.js';
+import { GpuModel } from '../src/gpu/model.js';
+import { Safetensors } from '../src/core/safetensors.js';
+import { FetchSource } from '../src/core/source-web.js';
+import { ModelConfig } from '../src/core/config.js';
+import { Tokenizer } from '../src/core/tokenizer.js';
+import { bf16ToF32Array } from '../src/core/dtype.js';
+
+const REPO = 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main';
+const EOS = new Set([151645, 151643]);
+
+const go = document.getElementById('go');
+const bar = document.getElementById('bar');
+const statusEl = document.getElementById('status');
+const outputCard = document.getElementById('outputCard');
+const output = document.getElementById('output');
+const statsCard = document.getElementById('statsCard');
+const statsEl = document.getElementById('stats');
+
+const say = (m) => { statusEl.textContent = m; };
+const progress = (v) => { bar.hidden = v === null; if (v !== null) bar.value = v; };
+
+let state = null;   // { ctx, model, st, tokenizer, config }
+
+/** Load once, keep for later runs. */
+async function load() {
+  if (state) return state;
+
+  say('checking WebGPU...');
+  const ctx = await GpuContext.create();
+
+  say('fetching the tokenizer and config...');
+  const [configText, tokenizerText] = await Promise.all([
+    fetch(`${REPO}/config.json`).then((r) => r.text()),
+    fetch(`${REPO}/tokenizer.json`).then((r) => r.text()),
+  ]);
+  const config = ModelConfig.parse(configText);
+  const tokenizer = Tokenizer.fromJSON(tokenizerText);
+
+  say('opening the weights over HTTP range requests...');
+  const st = await Safetensors.open(await FetchSource.open(`${REPO}/model.safetensors`));
+  config.checkAgainst(st);
+
+  const started = performance.now();
+  const model = await GpuModel.load(ctx, st, config, {
+    maxPositions: 1024,
+    onProgress: (done, total, what) => {
+      progress(done / total);
+      if (done % 6 === 0 || done === total) {
+        say(`downloading and converting weights to f16: ${done}/${total} (${what})`);
+      }
+    },
+  });
+  const loadSeconds = (performance.now() - started) / 1000;
+  progress(null);
+
+  state = { ctx, model, st, tokenizer, config, loadSeconds };
+  return state;
+}
+
+/** Embedding rows are gathered on the CPU: one row of 896 per token. */
+async function embed(st, config, ids) {
+  const d = config.hiddenSize;
+  const arr = new Float32Array(ids.length * d);
+  for (let t = 0; t < ids.length; t++) {
+    const bytes = await st.readRawRange('model.embed_tokens.weight', ids[t] * d * 2, d * 2);
+    const aligned = bytes.byteOffset % 2 === 0 ? bytes : new Uint8Array(bytes);
+    arr.set(bf16ToF32Array(new Uint16Array(aligned.buffer, aligned.byteOffset, d)), t * d);
+  }
+  return arr;
+}
+
+const escape = (s) => s.replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+
+go.addEventListener('click', async () => {
+  go.disabled = true;
+  statsCard.hidden = true;
+  try {
+    const { model, st, tokenizer, config, loadSeconds } = await load();
+
+    const promptText = document.getElementById('prompt').value;
+    const wanted = Math.max(1, Math.min(256, Number(document.getElementById('count').value) || 48));
+    const ids = tokenizer.encode(promptText);
+    if (ids.length === 0) throw new Error('the prompt is empty');
+
+    outputCard.style.display = 'block';
+    output.innerHTML = `<span class="prompt">${escape(promptText)}</span>`
+      + '<span class="gen"></span><span id="cursor"></span>';
+    const gen = output.querySelector('.gen');
+
+    say(`prefilling ${ids.length} tokens...`);
+    const cache = model.newCache(ids.length + wanted + 2);
+    const hidden = await embed(st, config, ids);
+
+    const t0 = performance.now();
+    let { logits } = await model.forward(hidden, ids.length, { cache, wantLogits: true });
+    const ttft = performance.now() - t0;
+
+    const generated = [];
+    const stepMs = [];
+    for (let i = 0; i < wanted; i++) {
+      let token = 0;
+      for (let j = 1; j < logits.length; j++) if (logits[j] > logits[token]) token = j;
+      if (EOS.has(token)) break;
+
+      generated.push(token);
+      gen.textContent = tokenizer.decode(generated);
+      say(`generating ${generated.length}/${wanted}`);
+      // Yield so the browser can paint between tokens.
+      await new Promise((r) => setTimeout(r, 0));
+
+      const row = await embed(st, config, [token]);
+      const s0 = performance.now();
+      ({ logits } = await model.forward(row, 1, { cache, wantLogits: true }));
+      stepMs.push(performance.now() - s0);
+    }
+
+    document.getElementById('cursor')?.remove();
+    const median = (a) => {
+      const s = [...a].sort((x, y) => x - y);
+      return s.length ? (s.length % 2 ? s[(s.length - 1) / 2]
+        : (s[s.length / 2 - 1] + s[s.length / 2]) / 2) : 0;
+    };
+    const step = median(stepMs);
+
+    statsEl.innerHTML = [
+      ['weights downloaded and uploaded', `${loadSeconds.toFixed(0)} s, once`],
+      ['prompt', `${ids.length} tokens`],
+      ['time to first token', `${ttft.toFixed(0)} ms (${(ids.length / (ttft / 1000)).toFixed(0)} tok/s prefill)`],
+      ['decode, median step', `${step.toFixed(0)} ms (${(1000 / step).toFixed(1)} tok/s)`],
+      ['tokens generated', generated.length],
+      ['weights on the GPU', '988 MB of f16'],
+    ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+    statsCard.hidden = false;
+    say('Done.');
+  } catch (error) {
+    say('');
+    outputCard.style.display = 'block';
+    output.innerHTML = `<span class="fail">${escape(String(error))}</span>`;
+    console.error(error);
+  } finally {
+    go.disabled = false;
+    progress(null);
+  }
+});
+</script>
+</main>
+</html>
