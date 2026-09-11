@@ -14,6 +14,11 @@ quantization are all in this repository.
 > changing a bit, runs on the GPU, quantizes to 8 and 4 bits with the damage
 > measured, loses to ONNX Runtime by a measured margin, and is deployed.
 >
+> **Since then**, a tiled matmul has made prefill 2.2 to 2.5 times faster and,
+> in the same change, decode twice as slow. It is committed but not deployed
+> while the decode regression is fixed: the live demo still runs the phase 6
+> kernels. [The measurements](#after-phase-6-tiling-the-prefill-and-what-it-did-to-decode).
+>
 > **[Live demo](https://abho7.github.io/llm-inference-webgpu/web/demo.html)** --
 > runs in your browser, streaming the weights from Hugging Face.
 > **[Report](https://abho7.github.io/llm-inference-webgpu/)** -- every number,
@@ -34,6 +39,70 @@ already do that. The claims worth making are narrower and checkable:
 | 6 | Quantization error is characterised per layer, not just end to end | 4 | **done** |
 | 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | **done** |
 | 8 | It runs, in public, in someone else's browser | 6 | **done** |
+
+## After phase 6: tiling the prefill, and what it did to decode
+
+Phase 5 traced the prefill gap to the kernel: a matrix-vector product per
+position re-reads all 716 MB of weights once per token, so a 52-token prompt
+moves 37 GB to do 51 GFLOP of arithmetic. `tiledMatmul()` stages a 32x128 tile
+of each weight matrix in workgroup memory and reuses it across up to 8
+positions. It sums every output in the same order whatever the batch tile, so
+prefill and single-token decode still agree bit for bit.
+
+`web/scaling.html` times both kernels on the same uploaded weights in the same
+session, five repeats each, interleaved with the order alternated so neither
+path inherits a residency state the other paid for. Before timing anything it
+checks that every shader compiled and that the two paths predict the same next
+token. They do, with logits within 1.1e-6 relative of each other.
+
+| prompt | matvec | tiled | speedup |
+|---|---|---|---|
+| 1 token | 124 ms | 160 ms | **0.77x** |
+| 8 | 413 ms | 175 ms | 2.36x |
+| 32 | 785 ms | 315 ms | 2.49x |
+| 52 | 1673 ms | 776 ms | 2.16x |
+| 64 | 1956 ms | 833 ms | 2.35x |
+| 128 | 3937 ms | 1656 ms | 2.38x |
+| 256 | 7868 ms | 3260 ms | 2.41x |
+
+Medians of five; every range is in `golden/measurements.json`. From eight
+tokens up, prefill is 2.2 to 2.5 times faster, levelling off near 78 tok/s
+against 32.5. The per-token rate is not monotonic between 32 and 64 tokens
+(101, 67, 77 tok/s), and I do not have an explanation for that yet.
+
+`web/bench.html`, running the phase 5 prompt through the tiled path, measured
+608 ms (runs of 696, 608 and 603), or 85.5 tok/s. Against ONNX Runtime's
+218 ms that is still a loss, by 2.8x or 3.6x depending on which of the two
+readings you take, down from 5.6x.
+
+The matvec path took 1673 ms on 52 tokens here against 1233 ms in phase 5,
+with identical kernel code: same machine, different day, different amount of
+free memory. That is why the two paths are measured side by side rather than
+against the old table.
+
+### It made decode twice as slow
+
+| decode step, after a 32-token prompt | median | range over 24 steps |
+|---|---|---|
+| matvec | 86.0 ms (11.6 tok/s) | 66.0-146.1 ms |
+| tiled | 178.1 ms (5.6 tok/s) | 160.8-219.6 ms |
+
+The ranges do not overlap, and `web/bench.html` independently measured a
+187.8 ms median on the tiled path. The single-token row of the prefill table
+shows the same thing from the other side.
+
+The cause is the thread mapping. At a batch tile of one, a workgroup's 256
+threads have 32 outputs between them: the other 224 help load the tile and
+then wait, while each of the 32 sums its 128 products serially. With a single
+position there is no weight reuse for the tile to buy, so the lost parallelism
+is pure cost. MATVEC spreads each row across all 256 threads and reduces in a
+tree.
+
+The obvious fix, sending single tokens back to MATVEC, would give up the
+property the tiled kernel was built around: the two kernels sum in different
+orders, so prefill and decode would stop agreeing bit for bit. So the change
+stays undeployed until decode is no slower than it was, and the fix has to
+keep that order.
 
 ## Phase 6: deployed
 
@@ -80,6 +149,8 @@ prefill here runs a matrix-*vector* product per position, with the sequence in
 the third dispatch dimension, rather than a real matrix multiply. One kernel
 serving both prefill and decode was a deliberate phase 3 choice to keep a single
 code path while correctness was being established, and this is what it costs.
+[The tiled matmul that followed](#after-phase-6-tiling-the-prefill-and-what-it-did-to-decode)
+more than halves prefill time, and in the same change doubles decode time.
 
 The ONNX Runtime figure is itself a lower bound: it passes the past keys and
 values as ordinary tensors, so every step copies the whole cache in and out.
@@ -362,6 +433,7 @@ node tools/serve.js                       # serves the repo with HTTP range supp
 #   /web/model.html      the whole model on the GPU, against the ONNX oracle
 #   /web/perplexity.html perplexity under each quantization scheme
 #   /web/bench.html      throughput, time to first token, per-kernel breakdown
+#   /web/scaling.html    prefill and decode across prompt lengths, matvec against tiled
 ```
 
 Range support is not incidental: the weights are 988 MB and the page needs
@@ -593,13 +665,12 @@ would have been. It is already confirmed working end to end: a greedy decode of
 src/core/     backend-agnostic: dtypes, safetensors, config, tokenizer, quantization
 src/cpu/      the reference forward pass and KV cache
 src/gpu/      WebGPU device plumbing and the WGSL kernels
-web/          browser harnesses: probe, kernel comparison, precision
+web/          browser harnesses: probe, kernels, precision, model, perplexity, bench, scaling, demo
 tools/        a static server with range support, for the browser harnesses
 oracle/       independent implementations, used only to generate golden files
 golden/       committed outputs of the oracle scripts
 validate/     gate reports; every number recomputed on the spot
 test/         node --test
-bench/        CPU vs GPU, one tab, one machine              (phase 5)
 ```
 
 `oracle/` is deliberately quarantined. Nothing in `src/` imports from it, and
