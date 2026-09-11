@@ -17,9 +17,10 @@
 point is repeated and reported as median with the full range, because this GPU shares system
 memory and a single reading is not a measurement: large weight matrices measurably settle into
 residency over the first few passes.</p>
-<p class="lede">Both matrix paths run on the same uploaded weights in the same session, with their
-repeats interleaved and the order alternated, so neither inherits a residency state the other
-paid for. The original matrix-vector kernel is the before; the tiled matmul is the after.</p>
+<p class="lede">All three matrix paths run on the same uploaded weights in the same session, with
+their repeats interleaved and the order rotated, so none inherits a residency state another paid
+for: matvec, the original kernel; tiled, the first attempt at batching it; and batched matvec,
+the default, which batches it without changing how any output is summed.</p>
 <div id="log">starting...</div>
 <div id="out"></div>
 
@@ -40,7 +41,11 @@ const LENGTHS = [1, 8, 32, 52, 64, 128, 256];
 const REPEATS = 5;
 const DECODE_STEPS = 24;
 const MAX_POS = 1024;
-const PATHS = ['matvec', 'tiled'];
+// batched is the default; tiled is faster at prefill but sums in a different
+// order from decode, and slower at decode.
+const PATHS = ['matvec', 'tiled', 'batched'];
+const DECODE_PATHS = PATHS;
+const LABELS = { matvec: 'matvec', tiled: 'tiled', batched: 'batched matvec' };
 
 const median = (a) => {
   const s = [...a].sort((x, y) => x - y);
@@ -77,7 +82,7 @@ try {
   const freshCache = (capacity) => model.newCache(capacity);
   const release = (cache) => { for (const b of [...cache.keys, ...cache.values]) b.destroy(); };
   const prefill = async (path, seq) => {
-    model.tiled = path === 'tiled';
+    model.matmul = path;
     const cache = freshCache(seq + 2);
     const t0 = performance.now();
     const result = await model.forward(hidden.subarray(0, seq * d), seq, { cache, wantLogits: true });
@@ -90,7 +95,7 @@ try {
   // which no later pass pays for. Each batch tile is its own pipeline, so every
   // one is touched here, on both paths. Excluded from every number below.
   say('warming up...');
-  for (const path of PATHS) for (const seq of [1, 2, 4, 8]) await prefill(path, seq);
+  for (const path of DECODE_PATHS) for (const seq of [1, 2, 4, 8]) await prefill(path, seq);
 
   // A kernel that fails to compile writes nothing and is very fast, so no
   // timing is believed until every shader is known to have compiled.
@@ -100,48 +105,55 @@ try {
   // different order, so this is a tolerance on the logits and exact on argmax.
   say('checking the two paths agree...');
   const agree = await (async () => {
-    const a = (await prefill('matvec', 52)).logits;
-    const b = (await prefill('tiled', 52)).logits;
-    let diff = 0, scale = 0;
-    for (let i = 0; i < a.length; i++) {
-      diff = Math.max(diff, Math.abs(a[i] - b[i]));
-      scale = Math.max(scale, Math.abs(a[i]));
+    const m = (await prefill('matvec', 52)).logits;
+    const t = (await prefill('tiled', 52)).logits;
+    const b = (await prefill('batched', 52)).logits;
+    const mBits = new Uint32Array(m.buffer, m.byteOffset, m.length);
+    const bBits = new Uint32Array(b.buffer, b.byteOffset, b.length);
+    let batchedDiffering = 0, diff = 0, scale = 0;
+    for (let i = 0; i < m.length; i++) {
+      if (mBits[i] !== bBits[i]) batchedDiffering++;
+      diff = Math.max(diff, Math.abs(m[i] - t[i]));
+      scale = Math.max(scale, Math.abs(m[i]));
     }
-    return { maxRelative: diff / scale, argmaxMatvec: argmax(a), argmaxTiled: argmax(b) };
+    return { logits: m.length, batchedDiffering, tiledMaxRelative: diff / scale,
+      argmaxMatvec: argmax(m), argmaxTiled: argmax(t), argmaxBatched: argmax(b) };
   })();
-  if (agree.argmaxMatvec !== agree.argmaxTiled || !(agree.maxRelative < 1e-4)) {
+  // batched sums in matvec's order, so it must match exactly; tiled does not,
+  // so it gets a tolerance and an exact argmax.
+  if (agree.batchedDiffering !== 0 || agree.argmaxTiled !== agree.argmaxMatvec
+      || !(agree.tiledMaxRelative < 1e-4)) {
     throw new Error(`paths disagree: ${JSON.stringify(agree)}`);
   }
 
   const rows = [];
   const render = () => {
-    out.innerHTML = `<p class="lede">Paths agree at 52 tokens: argmax ${agree.argmaxTiled} on both,
-      largest logit difference ${agree.maxRelative.toExponential(2)} relative.</p>
+    out.innerHTML = `<p class="lede">At 52 tokens, batched and matvec logits differ in
+      ${agree.batchedDiffering} of ${agree.logits.toLocaleString()} bit patterns; tiled differs from
+      matvec by at most ${agree.tiledMaxRelative.toExponential(2)} relative, with the same argmax.</p>
       <table>
-      <tr><th>prompt</th><th class="n">matvec median</th><th class="n">range</th>
-          <th class="n">tiled median</th><th class="n">range</th>
-          <th class="n">speedup</th><th class="n">tiled tok/s</th></tr>
+      <tr><th>prompt</th>${PATHS.map((p) => `<th class="n">${LABELS[p]}</th><th class="n">range</th>`).join('')}
+          ${PATHS.slice(1).map((p) => `<th class="n">${LABELS[p]} speedup</th>`).join('')}</tr>
       ${rows.map((r) => `<tr>
         <td>${r.seq} token${r.seq === 1 ? '' : 's'}</td>
-        <td class="n">${r.matvec.median.toFixed(1)} ms</td>
-        <td class="n">${r.matvec.min.toFixed(1)}&ndash;${r.matvec.max.toFixed(1)}</td>
-        <td class="n">${r.tiled.median.toFixed(1)} ms</td>
-        <td class="n">${r.tiled.min.toFixed(1)}&ndash;${r.tiled.max.toFixed(1)}</td>
-        <td class="n">${(r.matvec.median / r.tiled.median).toFixed(2)}x</td>
-        <td class="n">${(r.seq / (r.tiled.median / 1000)).toFixed(1)}</td></tr>`).join('')}
+        ${PATHS.map((p) => `<td class="n">${r[p].median.toFixed(1)} ms</td>
+          <td class="n">${r[p].min.toFixed(1)}&ndash;${r[p].max.toFixed(1)}</td>`).join('')}
+        ${PATHS.slice(1).map((p) => `<td class="n">${(r.matvec.median / r[p].median).toFixed(2)}x</td>`).join('')}
+      </tr>`).join('')}
     </table>`;
   };
 
   for (const seq of LENGTHS) {
-    const runs = { matvec: [], tiled: [] };
+    const runs = Object.fromEntries(PATHS.map((p) => [p, []]));
     for (let i = 0; i < REPEATS; i++) {
-      const order = i % 2 ? ['tiled', 'matvec'] : ['matvec', 'tiled'];
+      // Rotate which path goes first, so none systematically follows another.
+      const order = PATHS.map((_, k) => PATHS[(k + i) % PATHS.length]);
       for (const path of order) {
         runs[path].push((await prefill(path, seq)).ms);
         say(`prefill ${seq} tokens: run ${i + 1}/${REPEATS}, ${path}`);
       }
     }
-    rows.push({ seq, matvec: summarise(runs.matvec), tiled: summarise(runs.tiled) });
+    rows.push({ seq, ...Object.fromEntries(PATHS.map((p) => [p, summarise(runs[p])])) });
     render();
   }
 
@@ -150,35 +162,35 @@ try {
   // ever attends over keys the other computed.
   say('decode...');
   const caches = {};
-  for (const path of PATHS) {
-    model.tiled = path === 'tiled';
+  for (const path of DECODE_PATHS) {
+    model.matmul = path;
     caches[path] = freshCache(32 + DECODE_STEPS + 2);
     await model.forward(hidden.subarray(0, 32 * d), 32, { cache: caches[path], wantLogits: true });
   }
-  const steps = { matvec: [], tiled: [] };
+  const steps = Object.fromEntries(DECODE_PATHS.map((p) => [p, []]));
   for (let i = 0; i < DECODE_STEPS; i++) {
     const row = hidden.subarray((32 + i) * d, (33 + i) * d);
-    const order = i % 2 ? ['tiled', 'matvec'] : ['matvec', 'tiled'];
+    // Rotate which path goes first, so none systematically follows another.
+    const order = DECODE_PATHS.map((_, k) => DECODE_PATHS[(k + i) % DECODE_PATHS.length]);
     for (const path of order) {
-      model.tiled = path === 'tiled';
+      model.matmul = path;
       const t0 = performance.now();
       await model.forward(row, 1, { cache: caches[path], wantLogits: true });
       steps[path].push(performance.now() - t0);
     }
   }
-  for (const path of PATHS) release(caches[path]);
-  model.tiled = true;
+  for (const path of DECODE_PATHS) release(caches[path]);
+  model.matmul = 'batched';
 
-  const decode = { matvec: summarise(steps.matvec), tiled: summarise(steps.tiled) };
+  const decode = Object.fromEntries(DECODE_PATHS.map((p) => [p, summarise(steps[p])]));
 
   out.innerHTML += `<table>
-    <tr><th>decode (after a 32-token prompt)</th><th class="n">matvec</th><th class="n">tiled</th></tr>
-    <tr><td>median step</td>
-        <td class="n">${decode.matvec.median.toFixed(1)} ms (${(1000 / decode.matvec.median).toFixed(1)} tok/s)</td>
-        <td class="n">${decode.tiled.median.toFixed(1)} ms (${(1000 / decode.tiled.median).toFixed(1)} tok/s)</td></tr>
-    <tr><td>range over ${DECODE_STEPS} steps</td>
-        <td class="n">${decode.matvec.min.toFixed(1)}&ndash;${decode.matvec.max.toFixed(1)} ms</td>
-        <td class="n">${decode.tiled.min.toFixed(1)}&ndash;${decode.tiled.max.toFixed(1)} ms</td></tr>
+    <tr><th>decode (after a 32-token prompt)</th>
+        ${DECODE_PATHS.map((p) => `<th class="n">${LABELS[p]}</th>`).join('')}</tr>
+    <tr><td>median step</td>${DECODE_PATHS.map((p) => `<td class="n">${decode[p].median.toFixed(1)} ms
+        (${(1000 / decode[p].median).toFixed(1)} tok/s)</td>`).join('')}</tr>
+    <tr><td>range over ${DECODE_STEPS} steps</td>${DECODE_PATHS.map((p) => `<td class="n">${
+      decode[p].min.toFixed(1)}&ndash;${decode[p].max.toFixed(1)} ms</td>`).join('')}</tr>
   </table>`;
 
   window.__scaling = { prefill: rows, decode, agree, repeats: REPEATS, lengths: LENGTHS };

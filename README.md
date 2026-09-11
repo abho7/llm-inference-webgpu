@@ -14,10 +14,11 @@ quantization are all in this repository.
 > changing a bit, runs on the GPU, quantizes to 8 and 4 bits with the damage
 > measured, loses to ONNX Runtime by a measured margin, and is deployed.
 >
-> **Since then**, a tiled matmul has made prefill 2.2 to 2.5 times faster and,
-> in the same change, decode twice as slow. It is committed but not deployed
-> while the decode regression is fixed: the live demo still runs the phase 6
-> kernels. [The measurements](#after-phase-6-tiling-the-prefill-and-what-it-did-to-decode).
+> **Since then**, prefill reads each weight once for up to eight positions
+> rather than once per position: 1.4 to 1.75 times faster from 8 tokens up,
+> with decode unchanged and every logit still bit-identical to what the
+> matrix-vector engine produced.
+> [How, and the two attempts that came first](#after-phase-6-batching-the-prefill-without-changing-a-bit).
 >
 > **[Live demo](https://abho7.github.io/llm-inference-webgpu/web/demo.html)** --
 > runs in your browser, streaming the weights from Hugging Face.
@@ -40,69 +41,112 @@ already do that. The claims worth making are narrower and checkable:
 | 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | **done** |
 | 8 | It runs, in public, in someone else's browser | 6 | **done** |
 
-## After phase 6: tiling the prefill, and what it did to decode
+## After phase 6: batching the prefill without changing a bit
 
-Phase 5 traced the prefill gap to the kernel: a matrix-vector product per
-position re-reads all 716 MB of weights once per token, so a 52-token prompt
-moves 37 GB to do 51 GFLOP of arithmetic. `tiledMatmul()` stages a 32x128 tile
-of each weight matrix in workgroup memory and reuses it across up to 8
-positions. It sums every output in the same order whatever the batch tile, so
-prefill and single-token decode still agree bit for bit.
+Phase 5 traced the prefill gap to the kernel. MATVEC computes one row for one
+position per workgroup, so it re-reads all 716 MB of layer weights once per
+token, and a 52-token prompt moves 37 GB to do 51 GFLOP of arithmetic. Reading
+each weight once for several positions is the obvious fix. It took three
+attempts, and the one that shipped is not the fastest at prefill.
 
-`web/scaling.html` times both kernels on the same uploaded weights in the same
-session, five repeats each, interleaved with the order alternated so neither
-path inherits a residency state the other paid for. Before timing anything it
-checks that every shader compiled and that the two paths predict the same next
-token. They do, with logits within 1.1e-6 relative of each other.
+Every figure here comes from `web/scaling.html`, which runs all three matrix
+paths on the same uploaded weights in the same session, five repeats each,
+interleaved with the order rotated so no path inherits a residency state
+another paid for. Medians; every range is in `golden/measurements.json`.
 
-| prompt | matvec | tiled | speedup |
+| prompt | matvec | tiled | batched matvec (default) |
 |---|---|---|---|
-| 1 token | 124 ms | 160 ms | **0.77x** |
-| 8 | 413 ms | 175 ms | 2.36x |
-| 32 | 785 ms | 315 ms | 2.49x |
-| 52 | 1673 ms | 776 ms | 2.16x |
-| 64 | 1956 ms | 833 ms | 2.35x |
-| 128 | 3937 ms | 1656 ms | 2.38x |
-| 256 | 7868 ms | 3260 ms | 2.41x |
-
-Medians of five; every range is in `golden/measurements.json`. From eight
-tokens up, prefill is 2.2 to 2.5 times faster, levelling off near 78 tok/s
-against 32.5. The per-token rate is not monotonic between 32 and 64 tokens
-(101, 67, 77 tok/s), and I do not have an explanation for that yet.
-
-`web/bench.html`, running the phase 5 prompt through the tiled path, measured
-608 ms (runs of 696, 608 and 603), or 85.5 tok/s. Against ONNX Runtime's
-218 ms that is still a loss, by 2.8x or 3.6x depending on which of the two
-readings you take, down from 5.6x.
-
-The matvec path took 1673 ms on 52 tokens here against 1233 ms in phase 5,
-with identical kernel code: same machine, different day, different amount of
-free memory. That is why the two paths are measured side by side rather than
-against the old table.
-
-### It made decode twice as slow
+| 1 token | 64 ms | 162 ms | 71 ms |
+| 8 | 229 ms | 182 ms (1.26x) | 166 ms (1.37x) |
+| 32 | 767 ms | 361 ms (2.13x) | 512 ms (1.50x) |
+| 52 | 1194 ms | 582 ms (2.05x) | 836 ms (1.43x) |
+| 64 | 1674 ms | 713 ms (2.35x) | 1018 ms (1.64x) |
+| 128 | 3863 ms | 1606 ms (2.41x) | 2213 ms (1.75x) |
+| 256 | 7923 ms | 3336 ms (2.37x) | 4664 ms (1.70x) |
 
 | decode step, after a 32-token prompt | median | range over 24 steps |
 |---|---|---|
-| matvec | 86.0 ms (11.6 tok/s) | 66.0-146.1 ms |
-| tiled | 178.1 ms (5.6 tok/s) | 160.8-219.6 ms |
+| matvec | 68.5 ms (14.6 tok/s) | 56.4-87.4 ms |
+| tiled | 185.9 ms (5.4 tok/s) | 177.3-208.5 ms |
+| batched matvec | 66.0 ms (15.2 tok/s) | 60.5-93.4 ms |
 
-The ranges do not overlap, and `web/bench.html` independently measured a
-187.8 ms median on the tiled path. The single-token row of the prefill table
-shows the same thing from the other side.
+A single position on the batched path runs MATVEC itself, so the one-token
+prefill row and the matvec and batched decode rows are the same kernel. The
+gaps between them sit inside the ranges.
 
-The cause is the thread mapping. At a batch tile of one, a workgroup's 256
-threads have 32 outputs between them: the other 224 help load the tile and
-then wait, while each of the 32 sums its 128 products serially. With a single
-position there is no weight reuse for the tile to buy, so the lost parallelism
-is pure cost. MATVEC spreads each row across all 256 threads and reduces in a
-tree.
+### First attempt: a tiled matmul, and decode got more than twice as slow
 
-The obvious fix, sending single tokens back to MATVEC, would give up the
-property the tiled kernel was built around: the two kernels sum in different
-orders, so prefill and decode would stop agreeing bit for bit. So the change
-stays undeployed until decode is no slower than it was, and the fix has to
-keep that order.
+`tiledMatmul()` stages a 32x128 tile of the weights in workgroup memory and
+reuses it across up to eight positions. It is the fastest prefill here, 2.1 to
+2.4 times MATVEC from 32 tokens up, and it is written so that the order each
+output is summed in does not depend on the batch tile, which kept prefill and
+decode agreeing bit for bit.
+
+It also made decode 2.7 times slower in this run, and about twice as slow in
+the run that first caught it. At a batch tile of one, a workgroup's 256
+threads have 32 outputs between them, each summed serially, and a single
+position gets no weight reuse to pay for that. On the GPU's own clock, a
+decode token's matrix kernels take 116.6 ms on the tiled path against
+MATVEC's 23.5 ms. The output projection is excluded from both, since it always
+runs MATVEC.
+
+### A hypothesis I tested and had to drop: the idle threads
+
+The obvious reading was that the 224 idle threads were the cost. So I wrote a
+split-K kernel that sums in the tiled kernel's exact order -- each 128-column
+tile summed by its own thread, then the tile sums added in order by one thread
+per row -- and keeps every thread busy. It was bit-identical to the tiled
+kernel on both shapes checked. It was also no faster: 117.8 ms of matrix
+kernels per token.
+
+The cost was the order itself. Summing each 128-column run sequentially means
+one thread walks each run alone, so at one position neighbouring threads can
+never read neighbouring weights. MATVEC's neighbouring threads read
+neighbouring columns, and it runs at about 30 GB/s, close to what this shared
+memory delivers. Split-K is gone from the code; kept, it would only be dead
+code that looks like an option.
+
+### What shipped: batch the positions, keep MATVEC's order
+
+`batchedMatvec()` is MATVEC with more accumulators. One workgroup per row;
+each thread strides over the row, reads each weight once, coalesced with its
+neighbours, and multiplies it into one accumulator per position, up to eight.
+Each accumulator is then tree-reduced exactly as MATVEC reduces its one. Every
+output is the same operations on the same values in the same order as
+MATVEC's, and a single position simply runs MATVEC.
+
+That is checked rather than argued. `web/kernels.html` compares batch tiles of
+1, 2, 4 and 8 against MATVEC bitwise on two shapes, including the widest
+reduction in the model with an uneven final tile: 0 floats differ, and all 24
+kernel comparisons pass. `web/model.html` reproduces phase 3's agreement with
+the ONNX Runtime oracle to every printed digit -- 6.43e-5 worst per layer,
+4.74e-6 worst logit, argmax 5/5 -- and prefill against incremental decode is
+bit-identical across all 151,936 logits. At 52 tokens, the batched and matvec
+paths differ in 0 of 151,936 logits.
+
+### What it costs
+
+The tiled kernel is still faster at prefill: 582 ms against 836 ms on 52
+tokens. Keeping it would mean either decode 2.7 times slower, or sending single
+tokens to MATVEC and giving up the bit-exact agreement between prefill and
+decode, which is the property phase 2 established and every check since has
+leaned on. I took the slower prefill. The tiled path stays in the code,
+selectable with `matmul: 'tiled'`, so the gap is measured on every run of
+`web/scaling.html` rather than remembered.
+
+Against ONNX Runtime's 218 ms on the same prompt, measured in phase 5, 836 ms
+is still a loss, by 3.8x. MATVEC took 1194 ms in this session against 1233 ms
+in phase 5, so the same-session ratio is the fair measure of the gain: 1.43x at
+52 tokens, 1.64 to 1.75x from 64 tokens up.
+
+`web/bench.html` runs the phase 5 prompt through the default path end to end,
+and its first run disagreed: 1234 ms for the prefill and 97.4 ms per decode
+step, each about 1.48 times what the sweep had measured minutes earlier for
+the same kernels. Decode there is MATVEC, whose code has not changed since
+phase 3, so that run measured the machine rather than the kernel. Run again
+on its own, it measured 877 ms (runs of 879, 873 and 877) and 79.5 ms per
+decode step, which puts it 4.0 times behind ONNX Runtime on that reading. Both
+runs are recorded.
 
 ## Phase 6: deployed
 
@@ -149,8 +193,8 @@ prefill here runs a matrix-*vector* product per position, with the sequence in
 the third dispatch dimension, rather than a real matrix multiply. One kernel
 serving both prefill and decode was a deliberate phase 3 choice to keep a single
 code path while correctness was being established, and this is what it costs.
-[The tiled matmul that followed](#after-phase-6-tiling-the-prefill-and-what-it-did-to-decode)
-more than halves prefill time, and in the same change doubles decode time.
+[What followed](#after-phase-6-batching-the-prefill-without-changing-a-bit)
+makes prefill 1.4 to 1.75 times faster without changing a bit of its output.
 
 The ONNX Runtime figure is itself a lower bound: it passes the past keys and
 values as ordinary tensors, so every step copies the whole cache in and out.
@@ -433,7 +477,7 @@ node tools/serve.js                       # serves the repo with HTTP range supp
 #   /web/model.html      the whole model on the GPU, against the ONNX oracle
 #   /web/perplexity.html perplexity under each quantization scheme
 #   /web/bench.html      throughput, time to first token, per-kernel breakdown
-#   /web/scaling.html    prefill and decode across prompt lengths, matvec against tiled
+#   /web/scaling.html    prefill and decode across prompt lengths, every matrix path
 ```
 
 Range support is not incidental: the weights are 988 MB and the page needs
