@@ -25,6 +25,12 @@ export class GpuContext {
     this.features = features;
     this.pipelines = new Map();
     this.bytesUploaded = 0;
+    // A shader that fails to compile still yields a pipeline, and dispatching
+    // it quietly leaves the output buffer at zero -- which reads downstream as
+    // a plausible-looking wrong answer rather than an error. Compilation
+    // diagnostics are collected here and surfaced by assertShadersCompiled().
+    this.shaderErrors = [];
+    this.compilations = [];
     // When set, dispatch() records into this encoder instead of submitting.
     this.recording = null;
     this.submissions = 0;
@@ -106,6 +112,18 @@ export class GpuContext {
     const hit = this.pipelines.get(code);
     if (hit) return hit;
     const module = this.device.createShaderModule({ code, label });
+    this.compilations.push(
+      module.getCompilationInfo().then((info) => {
+        for (const message of info.messages) {
+          if (message.type !== 'error') continue;
+          const source = code.split(String.fromCharCode(10));
+          const line = (source[message.lineNum - 1] ?? '').trim();
+          this.shaderErrors.push(
+            `${label ?? 'kernel'} line ${message.lineNum}: ${message.message} | ${line}`,
+          );
+        }
+      }),
+    );
     const pipeline = this.device.createComputePipeline({
       label, layout: 'auto', compute: { module, entryPoint: 'main' },
     });
@@ -186,6 +204,21 @@ export class GpuContext {
   }
 
   async done() { await this.device.queue.onSubmittedWorkDone(); }
+
+  /**
+   * Throw if any shader compiled so far reported an error.
+   *
+   * Worth calling before believing any result: a kernel that fails to compile
+   * does not fail loudly, it writes nothing, and a buffer of zeros propagates
+   * as a wrong answer rather than as a crash.
+   */
+  async assertShadersCompiled() {
+    await Promise.all(this.compilations);
+    if (this.shaderErrors.length) {
+      const sep = String.fromCharCode(10) + '  ';
+      throw new Error(`shader compilation failed:${sep}${this.shaderErrors.join(sep)}`);
+    }
+  }
 
   /**
    * Run `count` dispatches inside one submission, timing each on the GPU.

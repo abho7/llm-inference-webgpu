@@ -24,7 +24,9 @@ in f16 actually costs.</p>
 
 <script type="module">
 import { GpuContext, grid2d } from '../src/gpu/device.js';
-import { MATVEC, RMSNORM, ROPE, ATTENTION, SWIGLU, ADD, GROUP } from '../src/gpu/kernels.js';
+import {
+  MATVEC, RMSNORM, ROPE, ATTENTION, SWIGLU, ADD, GROUP, TILE_ROWS, tiledMatmul,
+} from '../src/gpu/kernels.js';
 import { rmsNorm, matVec, swigluInPlace, ropeFrequencies, ropeInPlace, ropeTables } from '../src/core/ops.js';
 import { groupedAttention } from '../src/core/attention.js';
 import { f32ToF16Array, f16ToF32Array } from '../src/core/dtype.js';
@@ -161,6 +163,64 @@ try {
       compare(got, cpuF16), compare(got, cpuF32));
   }
 
+  // --------------------------------------------------- tiled matmul (batched) --
+  // Every batch-tile size against the same CPU reference, and against each
+  // other. The tile size decides only which outputs a workgroup covers, never
+  // the order any one of them is summed, so all four must agree bit for bit.
+  {
+    const rows = 4864;      // the widest projection in the model
+    const cols = 896;
+    const seq = 5;          // deliberately not a multiple of any tile size
+    const W = rand(rows * cols, 61);
+    const X = rand(seq * cols, 62);
+    const bias = rand(rows, 63);
+
+    const Wf16 = f32ToF16Array(W);
+    const gpuW = ctx.upload(Wf16, 'tW');
+    const gpuX = ctx.upload(X, 'tX');
+    const gpuB = ctx.upload(bias, 'tB');
+
+    const cpuF16 = new Float32Array(rows * seq);
+    const Wwide = throughF16(W);
+    for (let b = 0; b < seq; b++) {
+      matVec(Wwide, X.subarray(b * cols, (b + 1) * cols), rows, cols, bias,
+        cpuF16.subarray(b * rows, (b + 1) * rows));
+    }
+
+    const perTile = {};
+    for (const tile of [1, 2, 4, 8]) {
+      const gpuY = ctx.empty(seq * rows * 4, `tY${tile}`);
+      const { grid, width } = grid2d(Math.ceil(rows / TILE_ROWS));
+      const params = packUniform(ctx, [
+        ['u32', rows], ['u32', cols], ['u32', 1], ['u32', width],
+        ['u32', seq], ['u32', 0], ['u32', 0], ['u32', 0],
+      ]);
+      ctx.dispatch(tiledMatmul(tile), [gpuW, gpuX, gpuB, gpuY, params],
+        [grid[0], grid[1], Math.ceil(seq / tile)], `matmul-t${tile}`);
+      await ctx.done();
+      perTile[tile] = await ctx.readF32(gpuY, seq * rows);
+      record('matmul', `${rows}x${cols}, ${seq} pos, tile ${tile}`, 1e-5,
+        compare(perTile[tile], cpuF16), null);
+    }
+
+    // Bit-for-bit across tile sizes: this is the property that lets prefill
+    // and decode share a path and still agree exactly.
+    const reference = perTile[8];
+    const refBits = new Uint32Array(reference.buffer, reference.byteOffset, reference.length);
+    for (const tile of [1, 2, 4]) {
+      const got = perTile[tile];
+      const gotBits = new Uint32Array(got.buffer, got.byteOffset, got.length);
+      let differing = 0;
+      for (let i = 0; i < refBits.length; i++) if (refBits[i] !== gotBits[i]) differing++;
+      results.push({
+        name: 'matmul', note: `tile ${tile} vs tile 8, bitwise`,
+        tolerance: 0, ok: differing === 0,
+        kernelRel: differing, kernelAbs: differing, f16Rel: null, f16Abs: null,
+      });
+      render();
+    }
+  }
+
   // --------------------------------------------------------------- rmsnorm --
   {
     const rows = 5;
@@ -293,6 +353,7 @@ try {
     record('add', `${n} elements`, 1e-6, compare(got, cpu), null);
   }
 
+  await ctx.assertShadersCompiled();
   window.__done = true;
   window.__results = results;
   window.__ok = results.every((r) => r.ok);

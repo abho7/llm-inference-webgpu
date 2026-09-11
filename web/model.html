@@ -159,8 +159,47 @@ try {
     </table>`;
   }
 
-  const ok = argmaxAgree === rows.length;
+  // ---------------------------------------------------------- equivalence --
+  // Prefill over N tokens against the same N tokens decoded one at a time.
+  // Both paths run the same kernels over the same numbers in the same order,
+  // so this is an exact check, not a tolerance one: the tiled matmul chooses
+  // how many positions a workgroup covers but never how any single output is
+  // summed. A batch-indexing bug shows up here immediately, where a tolerance
+  // against the oracle could absorb it.
+  say('checking prefill against incremental decode...');
+  const equivIds = manifest.cases[0].input_ids.slice(0, 5);
+  const equivHidden = await embed(equivIds);
+
+  const prefillCache = model.newCache(equivIds.length + 2);
+  const prefill = await model.forward(equivHidden, equivIds.length,
+    { cache: prefillCache, wantLogits: true });
+
+  const stepCache = model.newCache(equivIds.length + 2);
+  let stepped = null;
+  for (let t = 0; t < equivIds.length; t++) {
+    stepped = await model.forward(equivHidden.subarray(t * d, (t + 1) * d), 1,
+      { cache: stepCache, wantLogits: true });
+  }
+
+  const asBits = (a) => new Uint32Array(a.buffer, a.byteOffset, a.length);
+  const pBits = asBits(prefill.logits);
+  const sBits = asBits(stepped.logits);
+  let differing = 0;
+  let firstAt = -1;
+  for (let i = 0; i < pBits.length; i++) {
+    if (pBits[i] !== sBits[i]) { differing++; if (firstAt < 0) firstAt = i; }
+  }
+  const equivalent = differing === 0;
+
+  out.innerHTML += `<h2 style="font-size:1rem;margin-top:1.6rem">Prefill vs incremental decode</h2>
+    <p class="lede">${equivIds.length} tokens through both paths, compared as raw f32 bits
+    across all ${pBits.length.toLocaleString()} logits: <b class="${equivalent ? 'pass' : 'fail'}">${
+      equivalent ? 'bit-identical' : `${differing} differ, first at ${firstAt}`}</b>.</p>`;
+
+  const ok = argmaxAgree === rows.length && equivalent;
+  await ctx.assertShadersCompiled();
   window.__model = { ok, rows, worstLayer, worstLogit, argmaxAgree,
+    equivalent, equivDiffering: differing,
     uploadedBytes: ctx.bytesUploaded, loadSeconds };
   window.__done = true;
   say(`done: ${(ctx.bytesUploaded / 1e6).toFixed(0)} MB of f16 weights, ` +
