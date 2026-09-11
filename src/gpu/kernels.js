@@ -215,6 +215,82 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 }
 
 /**
+ * y = W X + bias for up to `batchTile` positions per workgroup, summed in
+ * exactly MATVEC's order.
+ *
+ * One workgroup per output row, as in MATVEC. Each thread strides over the row
+ * and reads every weight it touches once, coalesced with its neighbours, then
+ * multiplies it into one accumulator per position. The accumulators are then
+ * tree-reduced exactly as MATVEC reduces its single one. So each output is the
+ * same operations on the same values in the same order as MATVEC's -- the
+ * batch tile changes how many positions share a weight read, never how any
+ * output is summed -- and weight traffic still falls by the batch tile.
+ *
+ * Accumulators are unrolled into named registers rather than a private array,
+ * which a compiler may otherwise spill to memory when indexed in a loop.
+ */
+export function batchedMatvec(batchTile) {
+  const B = batchTile;
+  if (B * GROUP * 4 > 16384) throw new Error(`batchTile ${B} needs more than 16 KB of partials`);
+  const each = (f) => Array.from({ length: B }, (_, b) => f(b)).join('\n');
+  return `${F16}
+struct Params { rows: u32, cols: u32, hasBias: u32, gridWidth: u32,
+                batch: u32, pad0: u32, pad1: u32, pad2: u32 };
+
+@group(0) @binding(0) var<storage, read>       W      : array<f16>;
+@group(0) @binding(1) var<storage, read>       x      : array<f32>;
+@group(0) @binding(2) var<storage, read>       bias   : array<f32>;
+@group(0) @binding(3) var<storage, read_write> y      : array<f32>;
+@group(0) @binding(4) var<uniform>             params : Params;
+
+var<workgroup> partial : array<f32, ${B * GROUP}>;
+
+@compute @workgroup_size(${GROUP})
+fn main(@builtin(workgroup_id) wg : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let row = wg.x + wg.y * params.gridWidth;
+  let bat0 = wg.z * ${B}u;
+  // Uniform across the workgroup, as in MATVEC, so the barriers stay uniform.
+  if (row >= params.rows) { return; }
+
+  let base = row * params.cols;
+  // Positions past the end read zeros; their outputs are never stored.
+${each((b) => `  let xb${b} = select(0u, (bat0 + ${b}u) * params.cols, bat0 + ${b}u < params.batch);
+  let live${b} = bat0 + ${b}u < params.batch;`)}
+${each((b) => `  var acc${b} = 0.0;`)}
+  var c = lid.x;
+  loop {
+    if (c >= params.cols) { break; }
+    let w = f32(W[base + c]);
+${each((b) => `    acc${b} = acc${b} + w * select(0.0, x[xb${b} + c], live${b});`)}
+    c = c + ${GROUP}u;
+  }
+${each((b) => `  partial[${b * GROUP}u + lid.x] = acc${b};`)}
+  workgroupBarrier();
+
+  var stride = ${GROUP / 2}u;
+  loop {
+    if (stride == 0u) { break; }
+    if (lid.x < stride) {
+${each((b) => `      partial[${b * GROUP}u + lid.x] = partial[${b * GROUP}u + lid.x] + partial[${b * GROUP}u + lid.x + stride];`)}
+    }
+    workgroupBarrier();
+    stride = stride >> 1u;
+  }
+
+  if (lid.x < ${B}u) {
+    let bat = bat0 + lid.x;
+    if (bat < params.batch) {
+      var v = partial[lid.x * ${GROUP}u];
+      if (params.hasBias == 1u) { v = v + bias[row]; }
+      y[bat * params.rows + row] = v;
+    }
+  }
+}`;
+}
+
+
+/**
  * RMS normalisation with a per-channel gain, one workgroup per row.
  *
  * The epsilon goes inside the square root, matching ops.js. Putting it outside

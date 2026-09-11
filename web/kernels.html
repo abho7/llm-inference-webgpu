@@ -26,6 +26,7 @@ in f16 actually costs.</p>
 import { GpuContext, grid2d } from '../src/gpu/device.js';
 import {
   MATVEC, RMSNORM, ROPE, ATTENTION, SWIGLU, ADD, GROUP, TILE_ROWS, tiledMatmul,
+  batchedMatvec,
 } from '../src/gpu/kernels.js';
 import { rmsNorm, matVec, swigluInPlace, ropeFrequencies, ropeInPlace, ropeTables } from '../src/core/ops.js';
 import { groupedAttention } from '../src/core/attention.js';
@@ -163,6 +164,30 @@ try {
       compare(got, cpuF16), compare(got, cpuF32));
   }
 
+  const dispatchMatvec = (W, X, B, Y, rows, cols, hasBias, seq) => {
+    const { grid, width } = grid2d(rows);
+    const params = packUniform(ctx, [
+      ['u32', rows], ['u32', cols], ['u32', hasBias ? 1 : 0], ['u32', width],
+    ]);
+    ctx.dispatch(MATVEC, [W, X, B, Y, params], [grid[0], grid[1], seq], 'matvec-seq');
+  };
+  const dispatchBatched = (tile, W, X, B, Y, rows, cols, hasBias, seq) => {
+    const { grid, width } = grid2d(rows);
+    const params = packUniform(ctx, [
+      ['u32', rows], ['u32', cols], ['u32', hasBias ? 1 : 0], ['u32', width],
+      ['u32', seq], ['u32', 0], ['u32', 0], ['u32', 0],
+    ]);
+    ctx.dispatch(batchedMatvec(tile), [W, X, B, Y, params],
+      [grid[0], grid[1], Math.ceil(seq / tile)], `matvec-b${tile}`);
+  };
+  const bitwiseDiffering = (a, b) => {
+    const x = new Uint32Array(a.buffer, a.byteOffset, a.length);
+    const y = new Uint32Array(b.buffer, b.byteOffset, b.length);
+    let differing = 0;
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) differing++;
+    return differing;
+  };
+
   // --------------------------------------------------- tiled matmul (batched) --
   // Every batch-tile size against the same CPU reference, and against each
   // other. The tile size decides only which outputs a workgroup covers, never
@@ -205,15 +230,54 @@ try {
 
     // Bit-for-bit across tile sizes: this is the property that lets prefill
     // and decode share a path and still agree exactly.
-    const reference = perTile[8];
-    const refBits = new Uint32Array(reference.buffer, reference.byteOffset, reference.length);
     for (const tile of [1, 2, 4]) {
-      const got = perTile[tile];
-      const gotBits = new Uint32Array(got.buffer, got.byteOffset, got.length);
-      let differing = 0;
-      for (let i = 0; i < refBits.length; i++) if (refBits[i] !== gotBits[i]) differing++;
+      const differing = bitwiseDiffering(perTile[8], perTile[tile]);
       results.push({
         name: 'matmul', note: `tile ${tile} vs tile 8, bitwise`,
+        tolerance: 0, ok: differing === 0,
+        kernelRel: differing, kernelAbs: differing, f16Rel: null, f16Abs: null,
+      });
+      render();
+    }
+  }
+
+  // ------------------------------------------------ batched matvec (default) --
+  // What prefill runs: MATVEC's per-row reduction, with each weight read once
+  // for up to eight positions. Every output is summed in MATVEC's order, so
+  // each batch tile is held bitwise to MATVEC itself, which is what decode
+  // runs. The second shape is the widest reduction in the model, with an
+  // uneven final batch tile.
+  for (const [rows, cols, seq, hasBias] of [[4864, 896, 5, true], [896, 4864, 11, false]]) {
+    const W = rand(rows * cols, 71);
+    const X = rand(seq * cols, 72);
+    const bias = rand(rows, 73);
+    const gpuW = ctx.upload(f32ToF16Array(W), 'bW');
+    const gpuX = ctx.upload(X, 'bX');
+    const gpuB = ctx.upload(bias, 'bB');
+
+    const Wwide = throughF16(W);
+    const cpuF16 = new Float32Array(rows * seq);
+    for (let b = 0; b < seq; b++) {
+      matVec(Wwide, X.subarray(b * cols, (b + 1) * cols), rows, cols, hasBias ? bias : null,
+        cpuF16.subarray(b * rows, (b + 1) * rows));
+    }
+
+    const refY = ctx.empty(seq * rows * 4, 'bYref');
+    dispatchMatvec(gpuW, gpuX, gpuB, refY, rows, cols, hasBias, seq);
+    await ctx.done();
+    const reference = await ctx.readF32(refY, seq * rows);
+
+    for (const tile of [1, 2, 4, 8]) {
+      const gpuY = ctx.empty(seq * rows * 4, `bY${tile}`);
+      dispatchBatched(tile, gpuW, gpuX, gpuB, gpuY, rows, cols, hasBias, seq);
+      await ctx.done();
+      const got = await ctx.readF32(gpuY, seq * rows);
+      if (tile === 8) {
+        record('batched matvec', `${rows}x${cols}, ${seq} pos, tile 8`, 1e-5, compare(got, cpuF16), null);
+      }
+      const differing = bitwiseDiffering(reference, got);
+      results.push({
+        name: 'batched matvec', note: `${rows}x${cols}, tile ${tile} vs matvec, bitwise`,
         tolerance: 0, ok: differing === 0,
         kernelRel: differing, kernelAbs: differing, f16Rel: null, f16Abs: null,
       });

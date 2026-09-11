@@ -161,11 +161,11 @@ try {
 
   // ---------------------------------------------------------- equivalence --
   // Prefill over N tokens against the same N tokens decoded one at a time.
-  // Both paths run the same kernels over the same numbers in the same order,
-  // so this is an exact check, not a tolerance one: the tiled matmul chooses
-  // how many positions a workgroup covers but never how any single output is
-  // summed. A batch-indexing bug shows up here immediately, where a tolerance
-  // against the oracle could absorb it.
+  // Both paths sum every output in the same order -- prefill's batched matvec
+  // chooses how many positions share a weight read, never how any single
+  // output is summed, and a single position runs MATVEC itself -- so this is
+  // an exact check, not a tolerance one. A batch-indexing bug shows up here
+  // immediately, where a tolerance against the oracle could absorb it.
   say('checking prefill against incremental decode...');
   const equivIds = manifest.cases[0].input_ids.slice(0, 5);
   const equivHidden = await embed(equivIds);

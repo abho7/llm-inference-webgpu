@@ -22,13 +22,15 @@
 //   uploaded as a table, because this adapter's sin and cos are only accurate
 //   to about 3e-5. See the comment in ops.js.
 //
-// Prefill runs the same kernels as decode, with the sequence in the third
-// dispatch dimension. That keeps one code path rather than two, at the cost of
-// a matrix-vector product per position instead of a real matrix multiply --
-// which is a phase 5 problem, not a correctness one.
+// Prefill and decode sum every output in the same order. A single position
+// runs MATVEC; several run batchedMatvec, which reads each weight once for up
+// to eight positions but reduces exactly as MATVEC does. So prefill no longer
+// re-reads the weights per position, and still agrees with incremental decode
+// bit for bit.
 
 import {
   MATVEC, RMSNORM, ROPE, ATTENTION, SWIGLU, ADD, GROUP, TILE_ROWS, tiledMatmul,
+  batchedMatvec,
 } from './kernels.js';
 import { grid2d } from './device.js';
 import { ropeTables } from '../core/ops.js';
@@ -78,26 +80,27 @@ export class GpuKVCache {
 }
 
 export class GpuModel {
-  constructor(ctx, config, weights, ropeTable, maxPositions, { tiled = true } = {}) {
+  constructor(ctx, config, weights, ropeTable, maxPositions, { matmul = 'batched' } = {}) {
     this.ctx = ctx;
     this.config = config;
     this.w = weights;
     this.ropeTable = ropeTable;
     this.maxPositions = maxPositions;
-    // Kept switchable so the tiled path can be measured against the original
-    // one on the same weights in the same session, rather than across a
-    // rebuild where machine state has moved underneath the comparison.
-    this.tiled = tiled;
+    // 'batched' (the default), 'tiled' or 'matvec'. Kept switchable so the
+    // paths can be measured against each other on the same weights in the same
+    // session, rather than across a rebuild where machine state has moved
+    // underneath the comparison. 'tiled' is faster at prefill but sums in a
+    // different order from decode, and is twice as slow at decode itself.
+    this.matmul = matmul;
     this.scratch = new Map();
   }
 
   /**
    * Positions one workgroup handles at once.
    *
-   * Only ever decides which outputs a workgroup computes, never the order any
-   * one of them is summed in, so every choice here produces bit-identical
-   * results to every other. That is what lets prefill and decode take the
-   * same code path and still agree exactly.
+   * For either batched kernel this only decides which outputs a workgroup
+   * computes, never the order any one of them is summed in, so every choice
+   * here produces bit-identical results to every other.
    */
   static batchTileFor(seq) {
     if (seq >= 8) return 8;
@@ -114,7 +117,7 @@ export class GpuModel {
    * 1.5 GB of browser heap on a machine that does not have it.
    */
   static async load(ctx, safetensors, config, {
-    maxPositions = 2048, onProgress, quantize = null, tiled = true,
+    maxPositions = 2048, onProgress, quantize = null, matmul = 'batched',
   } = {}) {
     // `quantize` runs the weights through a quantization scheme and back before
     // they are uploaded. The kernels still read f16, so this measures what
@@ -172,7 +175,7 @@ export class GpuModel {
       cos: ctx.upload(tables.cos, 'ropeCos'),
       sin: ctx.upload(tables.sin, 'ropeSin'),
     };
-    return new GpuModel(ctx, config, weights, ropeTable, maxPositions, { tiled });
+    return new GpuModel(ctx, config, weights, ropeTable, maxPositions, { matmul });
   }
 
   newCache(capacity) { return new GpuKVCache(this.ctx, this.config, capacity); }
@@ -233,7 +236,10 @@ export class GpuModel {
 
     const batchTile = GpuModel.batchTileFor(seq);
     const mv = (W, input, output, rows, cols, bias) => {
-      if (!this.tiled) {
+      // A single position on the batched path is MATVEC exactly: batchedMatvec
+      // at a tile of one computes the same bits, and MATVEC does it with less
+      // workgroup memory.
+      if (this.matmul === 'matvec' || (this.matmul === 'batched' && seq === 1)) {
         const { grid, width } = grid2d(rows);
         const params = pack(ctx, [
           ['u32', rows], ['u32', cols], ['u32', bias ? 1 : 0], ['u32', width],
@@ -242,6 +248,18 @@ export class GpuModel {
           [grid[0], grid[1], seq], 'matvec');
         return;
       }
+      if (this.matmul === 'batched') {
+        // One workgroup per row, per tile of positions.
+        const { grid, width } = grid2d(rows);
+        const params = pack(ctx, [
+          ['u32', rows], ['u32', cols], ['u32', bias ? 1 : 0], ['u32', width],
+          ['u32', seq], ['u32', 0], ['u32', 0], ['u32', 0],
+        ]);
+        ctx.dispatch(batchedMatvec(batchTile), [W, input, bias ?? noBias, output, params],
+          [grid[0], grid[1], Math.ceil(seq / batchTile)], 'matvec-batched');
+        return;
+      }
+      if (this.matmul !== 'tiled') throw new Error(`unknown matmul path '${this.matmul}'`);
       // One workgroup per tile of rows, per tile of positions.
       const { grid, width } = grid2d(Math.ceil(rows / TILE_ROWS));
       const params = pack(ctx, [
