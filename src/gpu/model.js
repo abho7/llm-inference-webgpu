@@ -27,7 +27,9 @@
 // a matrix-vector product per position instead of a real matrix multiply --
 // which is a phase 5 problem, not a correctness one.
 
-import { MATVEC, RMSNORM, ROPE, ATTENTION, SWIGLU, ADD, GROUP } from './kernels.js';
+import {
+  MATVEC, RMSNORM, ROPE, ATTENTION, SWIGLU, ADD, GROUP, TILE_ROWS, tiledMatmul,
+} from './kernels.js';
 import { grid2d } from './device.js';
 import { ropeTables } from '../core/ops.js';
 import { bf16ToF32Array, f32ToF16Array } from '../core/dtype.js';
@@ -76,13 +78,32 @@ export class GpuKVCache {
 }
 
 export class GpuModel {
-  constructor(ctx, config, weights, ropeTable, maxPositions) {
+  constructor(ctx, config, weights, ropeTable, maxPositions, { tiled = true } = {}) {
     this.ctx = ctx;
     this.config = config;
     this.w = weights;
     this.ropeTable = ropeTable;
     this.maxPositions = maxPositions;
+    // Kept switchable so the tiled path can be measured against the original
+    // one on the same weights in the same session, rather than across a
+    // rebuild where machine state has moved underneath the comparison.
+    this.tiled = tiled;
     this.scratch = new Map();
+  }
+
+  /**
+   * Positions one workgroup handles at once.
+   *
+   * Only ever decides which outputs a workgroup computes, never the order any
+   * one of them is summed in, so every choice here produces bit-identical
+   * results to every other. That is what lets prefill and decode take the
+   * same code path and still agree exactly.
+   */
+  static batchTileFor(seq) {
+    if (seq >= 8) return 8;
+    if (seq >= 4) return 4;
+    if (seq >= 2) return 2;
+    return 1;
   }
 
   /**
@@ -93,7 +114,7 @@ export class GpuModel {
    * 1.5 GB of browser heap on a machine that does not have it.
    */
   static async load(ctx, safetensors, config, {
-    maxPositions = 2048, onProgress, quantize = null,
+    maxPositions = 2048, onProgress, quantize = null, tiled = true,
   } = {}) {
     // `quantize` runs the weights through a quantization scheme and back before
     // they are uploaded. The kernels still read f16, so this measures what
@@ -151,7 +172,7 @@ export class GpuModel {
       cos: ctx.upload(tables.cos, 'ropeCos'),
       sin: ctx.upload(tables.sin, 'ropeSin'),
     };
-    return new GpuModel(ctx, config, weights, ropeTable, maxPositions);
+    return new GpuModel(ctx, config, weights, ropeTable, maxPositions, { tiled });
   }
 
   newCache(capacity) { return new GpuKVCache(this.ctx, this.config, capacity); }
@@ -210,13 +231,25 @@ export class GpuModel {
     const addParams = pack(ctx, [['u32', seq * d], ['u32', 0], ['u32', 0], ['u32', 0]]);
     const swigluParams = pack(ctx, [['u32', seq * ffn], ['u32', 0], ['u32', 0], ['u32', 0]]);
 
+    const batchTile = GpuModel.batchTileFor(seq);
     const mv = (W, input, output, rows, cols, bias) => {
-      const { grid, width } = grid2d(rows);
+      if (!this.tiled) {
+        const { grid, width } = grid2d(rows);
+        const params = pack(ctx, [
+          ['u32', rows], ['u32', cols], ['u32', bias ? 1 : 0], ['u32', width],
+        ]);
+        ctx.dispatch(MATVEC, [W, input, bias ?? noBias, output, params],
+          [grid[0], grid[1], seq], 'matvec');
+        return;
+      }
+      // One workgroup per tile of rows, per tile of positions.
+      const { grid, width } = grid2d(Math.ceil(rows / TILE_ROWS));
       const params = pack(ctx, [
         ['u32', rows], ['u32', cols], ['u32', bias ? 1 : 0], ['u32', width],
+        ['u32', seq], ['u32', 0], ['u32', 0], ['u32', 0],
       ]);
-      ctx.dispatch(MATVEC, [W, input, bias ?? noBias, output, params],
-        [grid[0], grid[1], seq], 'matvec');
+      ctx.dispatch(tiledMatmul(batchTile), [W, input, bias ?? noBias, output, params],
+        [grid[0], grid[1], Math.ceil(seq / batchTile)], 'matmul');
     };
 
     for (let layer = 0; layer < cfg.numLayers; layer++) {

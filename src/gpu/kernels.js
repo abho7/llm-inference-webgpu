@@ -78,6 +78,142 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   }
 }`;
 
+/** Rows of the weight matrix one workgroup owns. */
+export const TILE_ROWS = 32;
+/** Columns staged into workgroup memory per step. */
+export const TILE_K = 128;
+
+/**
+ * y = W X + bias, with a tile of W staged in workgroup memory and reused
+ * across `batchTile` sequence positions at once.
+ *
+ * MATVEC computes one output row for one position per workgroup, so it
+ * re-reads the entire weight matrix once per position. For a prefill of S
+ * tokens that is S passes over 716 MB of weights, and measurement put prefill
+ * at the memory system's practical limit while doing 52x more traffic than
+ * the arithmetic needs. Staging a tile and reusing it across positions divides
+ * the weight traffic by `batchTile`.
+ *
+ * Two properties this is written to preserve, both of them correctness rather
+ * than speed:
+ *
+ * The order in which a given output accumulates its products does not depend
+ * on `batchTile`. Every output is the sum, in column order, of per-tile sums
+ * each accumulated in column order. batchTile decides only which outputs a
+ * workgroup computes, never how any one of them is summed. That is what keeps
+ * prefill and single-token decode agreeing bit for bit rather than merely to
+ * a tolerance -- they run the same kernel over the same numbers in the same
+ * order.
+ *
+ * The summation is two-level on purpose. A flat sequential sum over 4864
+ * columns in f32 grows error like n*eps, around 3e-4 relative, which is close
+ * enough to the project's 5e-4 per-layer bound to be uncomfortable.
+ * Accumulating each 128-column tile separately and adding the tile totals
+ * makes it (TILE_K + cols/TILE_K)*eps instead: 166 terms rather than 4864.
+ *
+ * Every thread runs every barrier. Out-of-range rows and positions are
+ * handled by zero-filling the tiles and guarding the final store, never by
+ * returning early, since a workgroup that loses threads at a barrier
+ * deadlocks or reads uninitialised memory.
+ */
+export function tiledMatmul(batchTile) {
+  if (TILE_ROWS * batchTile > 256) {
+    throw new Error(
+      `batchTile ${batchTile} needs ${TILE_ROWS * batchTile} outputs, more than the 256 threads`,
+    );
+  }
+  return `${F16}
+struct Params { rows: u32, cols: u32, hasBias: u32, gridWidth: u32,
+                batch: u32, pad0: u32, pad1: u32, pad2: u32 };
+
+@group(0) @binding(0) var<storage, read>       W      : array<f16>;
+@group(0) @binding(1) var<storage, read>       x      : array<f32>;
+@group(0) @binding(2) var<storage, read>       bias   : array<f32>;
+@group(0) @binding(3) var<storage, read_write> y      : array<f32>;
+@group(0) @binding(4) var<uniform>             params : Params;
+
+const TR : u32 = ${TILE_ROWS}u;
+const TB : u32 = ${batchTile}u;
+const TK : u32 = ${TILE_K}u;
+
+var<workgroup> wTile : array<f16, ${TILE_ROWS * TILE_K}>;
+var<workgroup> xTile : array<f32, ${batchTile * TILE_K}>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg : vec3<u32>,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let rowTile = (wg.x + wg.y * params.gridWidth) * TR;
+  let batTile = wg.z * TB;
+
+  let t = lid.x;
+  // 256 threads over a TR x TB output tile, one output each. The tile holds
+  // TR*TB outputs, which is 256 only when TB is 8; for smaller tiles the
+  // surplus threads have no output of their own. They still load and still
+  // reach every barrier -- they simply do not accumulate or store. Letting
+  // them compute an index anyway ran myRow up to 255 against a 32-row tile
+  // and read whatever followed it in workgroup memory.
+  // 'active' is a WGSL reserved keyword; naming it that compiles to nothing
+  // and the kernel silently writes zeros.
+  let hasOutput = t < TR * TB;
+  let myRow = t / TB;
+  let myBat = t % TB;
+  let row = rowTile + myRow;
+  let bat = batTile + myBat;
+
+  var acc = 0.0;
+  var k0 = 0u;
+  loop {
+    if (k0 >= params.cols) { break; }
+
+    // Stage the weight tile. Out of range reads become zero, which is exact
+    // under addition and so cannot perturb the sum.
+    var i = t;
+    loop {
+      if (i >= TR * TK) { break; }
+      let r = rowTile + i / TK;
+      let c = k0 + i % TK;
+      var wv = 0.0h;
+      if (r < params.rows && c < params.cols) { wv = W[r * params.cols + c]; }
+      wTile[i] = wv;
+      i = i + 256u;
+    }
+    var j = t;
+    loop {
+      if (j >= TB * TK) { break; }
+      let b = batTile + j / TK;
+      let c = k0 + j % TK;
+      var xv = 0.0;
+      if (b < params.batch && c < params.cols) { xv = x[b * params.cols + c]; }
+      xTile[j] = xv;
+      j = j + 256u;
+    }
+    workgroupBarrier();
+
+    // No barrier inside, so this may diverge safely.
+    if (hasOutput) {
+      var tileAcc = 0.0;
+      var c2 = 0u;
+      loop {
+        if (c2 >= TK) { break; }
+        tileAcc = tileAcc + f32(wTile[myRow * TK + c2]) * xTile[myBat * TK + c2];
+        c2 = c2 + 1u;
+      }
+      acc = acc + tileAcc;
+    }
+
+    // Before overwriting the tiles on the next pass.
+    workgroupBarrier();
+    k0 = k0 + TK;
+  }
+
+  if (hasOutput && row < params.rows && bat < params.batch) {
+    var v = acc;
+    if (params.hasBias == 1u) { v = v + bias[row]; }
+    y[bat * params.rows + row] = v;
+  }
+}`;
+}
+
 /**
  * RMS normalisation with a per-channel gain, one workgroup per row.
  *

@@ -1,0 +1,144 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Scaling</title>
+<style>
+  body { font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem;
+         max-width: 74rem; color: #111; }
+  h1 { font-size: 1.15rem; margin-bottom: 0.2rem; }
+  p.lede { color: #444; max-width: 48rem; }
+  table { border-collapse: collapse; margin: 1rem 0; font-size: 12px; }
+  th, td { padding: 0.3rem 1.3rem 0.3rem 0; text-align: left; border-bottom: 1px solid #eee; }
+  th { color: #666; font-weight: normal; }
+  td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  #log { color: #666; font-size: 12px; }
+</style>
+<h1>How throughput scales with prompt length</h1>
+<p class="lede">Prefill is timed to first logits, which is what a caller actually waits for. Every
+point is repeated and reported as median with the full range, because this GPU shares system
+memory and a single reading is not a measurement: large weight matrices measurably settle into
+residency over the first few passes.</p>
+<div id="log">starting...</div>
+<div id="out"></div>
+
+<script type="module">
+import { GpuContext } from '../src/gpu/device.js';
+import { GpuModel } from '../src/gpu/model.js';
+import { Safetensors } from '../src/core/safetensors.js';
+import { FetchSource } from '../src/core/source-web.js';
+import { ModelConfig } from '../src/core/config.js';
+import { bf16ToF32Array } from '../src/core/dtype.js';
+
+const log = document.getElementById('log');
+const out = document.getElementById('out');
+const say = (m) => { log.textContent = m; console.log('[scaling]', m); };
+
+const LENGTHS = [1, 8, 32, 64, 128, 256];
+const REPEATS = 5;
+const DECODE_STEPS = 24;
+const MAX_POS = 1024;
+
+const median = (a) => {
+  const s = [...a].sort((x, y) => x - y);
+  return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+};
+
+try {
+  const base = '..';
+  const config = ModelConfig.parse(await (await fetch(`${base}/weights/config.json`)).text());
+  const st = await Safetensors.open(await FetchSource.open(`${base}/weights/model.safetensors`));
+  const ctx = await GpuContext.create();
+  const d = config.hiddenSize;
+
+  say('uploading weights...');
+  const model = await GpuModel.load(ctx, st, config, {
+    maxPositions: MAX_POS,
+    onProgress: (done, total) => { if (done % 40 === 0) say(`uploading ${done}/${total}`); },
+  });
+
+  // One embedding row per position. Reused across every measurement so the
+  // timings are of the forward pass, not of range requests.
+  say('gathering embeddings...');
+  const longest = Math.max(...LENGTHS) + DECODE_STEPS + 2;
+  const hidden = new Float32Array(longest * d);
+  for (let t = 0; t < longest; t++) {
+    const id = 1000 + t * 7;                       // arbitrary but in-vocabulary
+    const bytes = await st.readRawRange('model.embed_tokens.weight', id * d * 2, d * 2);
+    const aligned = bytes.byteOffset % 2 === 0 ? bytes : new Uint8Array(bytes);
+    hidden.set(bf16ToF32Array(new Uint16Array(aligned.buffer, aligned.byteOffset, d)), t * d);
+  }
+
+  const freshCache = (capacity) => model.newCache(capacity);
+  const release = (cache) => { for (const b of [...cache.keys, ...cache.values]) b.destroy(); };
+
+  // Warm-up: the first dispatch of every pipeline pays for shader compilation,
+  // which no later pass pays for. Excluded from every number below.
+  say('warming up...');
+  {
+    const c = freshCache(8);
+    await model.forward(hidden.subarray(0, 4 * d), 4, { cache: c, wantLogits: true });
+    release(c);
+  }
+
+  const rows = [];
+  const render = () => {
+    out.innerHTML = `<table>
+      <tr><th>prompt</th><th class="n">prefill median</th><th class="n">range</th>
+          <th class="n">tok/s</th><th class="n">ms/token</th></tr>
+      ${rows.map((r) => `<tr>
+        <td>${r.seq} token${r.seq === 1 ? '' : 's'}</td>
+        <td class="n">${r.median.toFixed(1)} ms</td>
+        <td class="n">${r.min.toFixed(1)}&ndash;${r.max.toFixed(1)}</td>
+        <td class="n">${(r.seq / (r.median / 1000)).toFixed(1)}</td>
+        <td class="n">${(r.median / r.seq).toFixed(2)}</td></tr>`).join('')}
+    </table>`;
+  };
+
+  for (const seq of LENGTHS) {
+    const runs = [];
+    for (let i = 0; i < REPEATS; i++) {
+      const cache = freshCache(seq + 2);
+      const t0 = performance.now();
+      await model.forward(hidden.subarray(0, seq * d), seq, { cache, wantLogits: true });
+      runs.push(performance.now() - t0);
+      release(cache);
+      say(`prefill ${seq} tokens: run ${i + 1}/${REPEATS}`);
+    }
+    rows.push({ seq, runs, median: median(runs), min: Math.min(...runs), max: Math.max(...runs) });
+    render();
+  }
+
+  // Decode: prefill a short prompt once, then time each single-token step.
+  say('decode...');
+  const decodeCache = freshCache(32 + DECODE_STEPS + 2);
+  await model.forward(hidden.subarray(0, 32 * d), 32, { cache: decodeCache, wantLogits: true });
+  const steps = [];
+  for (let i = 0; i < DECODE_STEPS; i++) {
+    const row = hidden.subarray((32 + i) * d, (33 + i) * d);
+    const t0 = performance.now();
+    await model.forward(row, 1, { cache: decodeCache, wantLogits: true });
+    steps.push(performance.now() - t0);
+  }
+  release(decodeCache);
+
+  const decode = {
+    median: median(steps), min: Math.min(...steps), max: Math.max(...steps), steps,
+  };
+
+  out.innerHTML += `<table>
+    <tr><th>decode (after a 32-token prompt)</th><th class="n"></th></tr>
+    <tr><td>median step</td><td class="n">${decode.median.toFixed(1)} ms
+        (${(1000 / decode.median).toFixed(1)} tok/s)</td></tr>
+    <tr><td>range over ${DECODE_STEPS} steps</td>
+        <td class="n">${decode.min.toFixed(1)}&ndash;${decode.max.toFixed(1)} ms</td></tr>
+  </table>`;
+
+  window.__scaling = { prefill: rows, decode, repeats: REPEATS, lengths: LENGTHS };
+  window.__done = true;
+  say('done');
+} catch (error) {
+  window.__done = true;
+  window.__error = String(error) + '\n' + (error.stack ?? '');
+  log.innerHTML = `<span style="color:#b00">${String(error)}</span>`;
+  out.innerHTML = `<pre>${error.stack ?? ''}</pre>`;
+}
+</script>
