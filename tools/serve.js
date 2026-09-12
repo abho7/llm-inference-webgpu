@@ -31,13 +31,22 @@ const server = createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const requested = decodeURIComponent(url.pathname);
   const relative = normalize(requested).replace(/^([/\\])+/, '');
-  const path = join(ROOT, relative === '' ? 'web/index.html' : relative);
+  let path = join(ROOT, relative);
 
   // Refuse anything that escapes the repository. The server exists to hand the
-  // browser this project's files and nothing else.
+  // browser this project's files and nothing else. Checked before the
+  // directory rule below, so no resolution can walk out of the tree.
   if (!path.startsWith(ROOT + sep) && path !== ROOT) {
     res.writeHead(403).end('outside the repository');
     return;
+  }
+
+  // A directory serves its index.html, as GitHub Pages does. The report is
+  // index.html at the repository root, so without this the local server
+  // disagrees at `/` with the deployment it stands in for -- which is how it
+  // 404'd there while the published site was fine.
+  if (existsSync(path) && statSync(path).isDirectory()) {
+    path = join(path, 'index.html');
   }
   if (!existsSync(path) || statSync(path).isDirectory()) {
     res.writeHead(404).end(`not found: ${relative}`);
@@ -95,6 +104,8 @@ const server = createServer((req, res) => {
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`serving ${ROOT} at http://127.0.0.1:${port}/`);
+  console.log(`  report:  http://127.0.0.1:${port}/`);
+  console.log(`  demo:    http://127.0.0.1:${port}/web/demo.html`);
   console.log(`  probe:   http://127.0.0.1:${port}/web/probe.html`);
-  console.log(`  harness: http://127.0.0.1:${port}/web/index.html`);
+  console.log(`  harness: http://127.0.0.1:${port}/web/{kernels,model,scaling,bench,perplexity,precision}.html`);
 });
