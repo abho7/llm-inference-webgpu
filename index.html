@@ -65,6 +65,7 @@
     <a href="https://github.com/abho7/llm-inference-webgpu"><b>Source</b> <span>&mdash; GitHub</span></a>
     <a href="web/bench.html"><b>Benchmark</b> <span>&mdash; throughput, per-kernel</span></a>
     <a href="web/kernels.html"><b>Kernels</b> <span>&mdash; GPU vs CPU</span></a>
+    <a href="web/scaling.html"><b>Scaling</b> <span>&mdash; prompt length, every path</span></a>
     <a href="web/model.html"><b>Model</b> <span>&mdash; GPU vs ONNX oracle</span></a>
     <a href="web/perplexity.html"><b>Perplexity</b> <span>&mdash; per quantization scheme</span></a>
     <a href="web/precision.html"><b>Precision</b> <span>&mdash; adapter transcendentals</span></a>
@@ -107,33 +108,75 @@ try {
     <tr><td>Same next token as the oracle</td>
         <td class="n good">${m.phase3.gpuArgmaxAgreement}</td>
         <td>argmax, no tolerance allowed</td></tr>
+    <tr><td>Batching the prompt changes no output</td>
+        <td class="n good">${m.prefillBatching.batchedVsMatvecDifferingLogitsAt52Tokens} of 151,936 logits differ</td>
+        <td>the matrix-vector kernel, bit for bit</td></tr>
   </table></div>`);
 
   // ------------------------------------------------------------ performance --
   const e = m.phase5.engine;
   const o = m.phase5.onnxRuntimeCpu;
+  const b = m.prefillBatching;
+  const at = (n) => b.prefill.find((r) => r.tokens === n);
+  const dec = b.decodeAfter32Tokens;
+  const prefillRate = 52 / (at(52).batchedMs / 1000);
+  const decodeRate = 1000 / dec.batchedMedianMs;
   parts.push(`<h2>Speed, against a real inference runtime</h2>
-  <p>The baseline is ONNX Runtime on this machine's CPU running the same model. It wins.</p>
+  <p>The baseline is ONNX Runtime on this machine's CPU running the same model. It still wins
+  the prompt, by less than it did.</p>
   <div class="wrap"><table>
     <tr><th></th><th class="n">this engine</th><th class="n">ONNX Runtime</th><th class="n">ratio</th></tr>
-    <tr><td>prefill, ${e.prefillTokens}-token prompt</td>
-        <td class="n">${e.prefillTokensPerSecond} tok/s</td>
+    <tr><td>prefill, ${o.prefillTokens}-token prompt</td>
+        <td class="n">${prefillRate.toFixed(1)} tok/s</td>
         <td class="n">${o.prefillTokensPerSecond} tok/s</td>
-        <td class="n warn">ORT ${(o.prefillTokensPerSecond / e.prefillTokensPerSecond).toFixed(1)}x</td></tr>
+        <td class="n warn">ORT ${(o.prefillTokensPerSecond / prefillRate).toFixed(1)}x</td></tr>
     <tr><td>decode, median step</td>
-        <td class="n">${e.decodeTokensPerSecond} tok/s</td>
+        <td class="n">${decodeRate.toFixed(1)} tok/s</td>
         <td class="n">${o.decodeTokensPerSecond} tok/s</td>
-        <td class="n warn">ORT ${(o.decodeTokensPerSecond / e.decodeTokensPerSecond).toFixed(1)}x</td></tr>
+        <td class="n">&mdash;</td></tr>
   </table></div>
-  <p style="color:var(--dim);font-size:0.86rem">Decode varied from
-  ${e.decodeRangeAcrossRunsMs[0]} to ${e.decodeRangeAcrossRunsMs[1]} ms across runs on a
-  shared integrated GPU; the faster figure is quoted above and the range here. The ONNX
-  figure is itself a lower bound: ${esc(o.caveat)}.</p>`);
+  <p style="color:var(--dim);font-size:0.86rem">The engine's figures come from one session with
+  about 2.4 GB of system memory free; ONNX Runtime's are from phase 5, on another day. The decode
+  kernels have not changed since phase 3, and they measured ${e.decodeMedianMs} ms then against
+  ${dec.batchedMedianMs} ms here &mdash; the same code on a different machine state, not an
+  improvement, which is why that row carries no ratio. The ONNX figure is itself a lower bound:
+  ${esc(o.caveat)}.</p>
+
+  <h3>What the prompt costs</h3>
+  <p>Prefill used to read every weight once per token. It now reads each one once for up to eight
+  positions, and sums every output in exactly the order the single-token kernel sums it. All three
+  paths below ran on the same uploaded weights in one session, their repeats interleaved and the
+  order rotated.</p>
+  <div class="wrap"><table>
+    <tr><th></th><th class="n">matvec</th><th class="n">tiled</th>
+        <th class="n">batched, shipped</th><th class="n">vs matvec</th></tr>
+    ${[8, 52, 256].map((n) => {
+      const r = at(n);
+      return `<tr><td>prefill, ${n} tokens</td>
+        <td class="n">${r.matvecMs.toFixed(0)} ms</td>
+        <td class="n">${r.tiledMs.toFixed(0)} ms</td>
+        <td class="n">${r.batchedMs.toFixed(0)} ms</td>
+        <td class="n good">${(r.matvecMs / r.batchedMs).toFixed(2)}x</td></tr>`;
+    }).join('')}
+    <tr><td>decode, median step</td>
+        <td class="n">${dec.matvecMedianMs} ms</td>
+        <td class="n warn">${dec.tiledMedianMs} ms</td>
+        <td class="n">${dec.batchedMedianMs} ms</td>
+        <td class="n">same kernel</td></tr>
+  </table></div>
+  <p style="color:var(--dim);font-size:0.86rem">The batched kernel changes nothing it computes: at
+  52 tokens its logits differ from the matrix-vector kernel's in
+  <b class="good">${b.batchedVsMatvecDifferingLogitsAt52Tokens} of 151,936</b> bit patterns, and a
+  prompt run whole differs from the same prompt decoded one token at a time in
+  <b class="good">${b.prefillVsIncrementalDecodeDifferingLogits}</b>. The tiled kernel is faster on
+  the prompt and sums in a different order, which cost
+  ${(dec.tiledMedianMs / dec.matvecMedianMs).toFixed(1)}x on every generated token; it stays in the
+  code, selectable, so the gap is measured rather than remembered.</p>`);
 
   const per = Object.entries(m.phase5.perTokenGpuMs);
   const peak = Math.max(...per.map(([, v]) => v));
   const totalGpu = per.reduce((a, [, v]) => a + v, 0);
-  parts.push(`<h3>Where a decode step goes</h3>
+  parts.push(`<h3>Where a decode step goes, in the phase 5 session</h3>
   <div class="wrap"><table>
     <tr><th>kernel</th><th class="n">per token</th><th class="n">share</th><th></th></tr>
     ${per.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v.toFixed(2)} ms</td>
@@ -174,7 +217,19 @@ try {
   token on two of five prompts.</p>`);
 
   // ---------------------------------------------------- things I got wrong --
-  parts.push(`<h2>Three things that went against me</h2>
+  parts.push(`<h2>Four things that went against me</h2>
+
+  <h3>The faster prompt kernel made every token slower</h3>
+  <p>A tiled matmul cut the prompt time by more than half and, in the same change, more than
+  doubled the cost of every generated token: at a batch tile of one, 32 of a workgroup's 256
+  threads own an output and each sums its products serially. The fix that suggested itself
+  &mdash; keep that order, put every thread to work &mdash; was written, came out bit-identical,
+  and was no faster at all: ${b.decodeMatrixGpuMsPerToken.splitK} ms of matrix kernels per token
+  against the tiled kernel's ${b.decodeMatrixGpuMsPerToken.tiledBatchTile1}, where the
+  matrix-vector kernel needs ${b.decodeMatrixGpuMsPerToken.matvec}. The order itself was the
+  cost: summing each run of 128 columns in sequence means one thread walks it alone, so at a
+  single position neighbouring threads cannot read neighbouring weights. What shipped keeps the
+  matrix-vector kernel's order and batches the positions instead.</p>
 
   <h3>The outlier channel was not the problem</h3>
   <p>Phase 1 found channel 490 growing to 27 times the RMS of the hidden state, and I wrote
