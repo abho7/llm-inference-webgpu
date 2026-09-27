@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Two linked nodes">
+  <!-- The site's own motif at icon scale: a link between two nodes, drawn in
+       the same signed ramp the headings use. Three shapes is all that stays
+       legible at 16px. -->
+  <defs>
+    <linearGradient id="r" x1="12" y1="46" x2="52" y2="18" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#56e1ff"/>
+      <stop offset=".55" stop-color="#ff7ed0"/>
+      <stop offset="1" stop-color="#ff4fbe"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0a0a0c"/>
+  <path d="M18 44 L46 20" stroke="url(#r)" stroke-width="5" stroke-linecap="round" fill="none"/>
+  <circle cx="18" cy="44" r="9" fill="#56e1ff"/>
+  <circle cx="46" cy="20" r="9" fill="#ff4fbe"/>
+</svg>
