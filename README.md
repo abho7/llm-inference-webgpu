@@ -1,5 +1,9 @@
 # llm-inference-webgpu
 
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+[![tests](https://github.com/abho7/llm-inference-webgpu/actions/workflows/tests.yml/badge.svg)](https://github.com/abho7/llm-inference-webgpu/actions/workflows/tests.yml)
+
 A transformer inference engine written from scratch, running
 [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct), with
 every correctness claim checked against an independent implementation and every
