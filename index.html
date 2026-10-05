@@ -12,14 +12,14 @@
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://abho7.github.io/llm-inference-webgpu/">
 <meta property="og:title" content="llm-inference-webgpu">
-<meta property="og:description" content="Qwen2.5-0.5B end to end on WebGPU, written from scratch: no PyTorch, no transformers, no tokenizer library. Loses to ONNX Runtime by a measured margin, 5.6x at prefill and 1.3x at decode.">
+<meta property="og:description" content="Qwen2.5-0.5B end to end on WebGPU, written from scratch: no PyTorch, no transformers, no tokenizer library. Measured against ONNX Runtime in the same session: loses the prompt, wins every generated token.">
 <meta property="og:image" content="https://abho7.github.io/llm-inference-webgpu/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="llm-inference-webgpu - loses to ONNX Runtime: 5.6x prefill, 1.3x decode">
+<meta property="og:image:alt" content="llm-inference-webgpu - against ONNX Runtime in the same session: slower prefill, faster decode">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="llm-inference-webgpu">
-<meta name="twitter:description" content="Qwen2.5-0.5B end to end on WebGPU, written from scratch: no PyTorch, no transformers, no tokenizer library. Loses to ONNX Runtime by a measured margin, 5.6x at prefill and 1.3x at decode.">
+<meta name="twitter:description" content="Qwen2.5-0.5B end to end on WebGPU, written from scratch: no PyTorch, no transformers, no tokenizer library. Measured against ONNX Runtime in the same session: loses the prompt, wins every generated token.">
 <meta name="twitter:image" content="https://abho7.github.io/llm-inference-webgpu/og.png">
 <style>
   :root {
@@ -46,6 +46,7 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
           padding: 1.1rem 1.25rem; margin: 1rem 0; }
   .wrap { overflow-x: auto; }
+  .wrap + .wrap { margin-top: 1.4rem; }
   table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
   th { text-align: left; font-weight: 500; color: var(--faint); padding: 0.3rem 1.2rem 0.5rem 0;
        border-bottom: 1px solid var(--line); white-space: nowrap; }
@@ -61,6 +62,8 @@
   .links a span { color: var(--faint); font-size: 0.82rem; }
   .lead { border-left: 3px solid var(--accent); }
   footer { margin-top: 4rem; color: var(--faint); font-size: 0.82rem; }
+  .note { color: var(--dim); font-size: 0.86rem; }
+  td.mode { color: var(--dim); white-space: nowrap; }
   .bar { display: inline-block; height: 8px; background: var(--accent); border-radius: 2px;
          vertical-align: middle; }
 </style>
@@ -129,42 +132,134 @@ try {
     <tr><td>Batching the prompt changes no output</td>
         <td class="n good">${m.prefillBatching.batchedVsMatvecDifferingLogitsAt52Tokens} of 151,936 logits differ</td>
         <td>the matrix-vector kernel, bit for bit</td></tr>
+    <tr><td>Reusing GPU objects changes no output</td>
+        <td class="n good">${m.decodeOverhead.sameSessionAB.differingLogits} of
+          ${m.decodeOverhead.sameSessionAB.comparedLogitsPerRun.toLocaleString()} logits differ</td>
+        <td>the previous engine, bit for bit, ${m.decodeOverhead.sameSessionAB.runs} runs</td></tr>
   </table></div>`);
 
   // ------------------------------------------------------------ performance --
-  const e = m.phase5.engine;
-  const o = m.phase5.onnxRuntimeCpu;
+  // Every timing names the Windows power mode it ran under: on this laptop the
+  // CPU baseline moved 3.3x between modes while the GPU engine barely moved,
+  // so a ratio means something only inside one mode and one session.
+  const D = m.decodeOverhead;
+  const mode = (key) => (D.powerModes[key] ? D.powerModes[key].label : key);
+  const modeCell = (key) => `<td class="mode">${esc(mode(key))}</td>`;
+  const med = (a) => {
+    const v = [].concat(a).sort((x, y) => x - y);
+    const n = v.length;
+    return n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
+  };
+  const ms = (v) => `${Number(v).toFixed(1)} ms`;
+  const list = (a) => [].concat(a).map((v) => Number(v).toFixed(1)).join(', ');
+  const span = (a) => `${Number(a[0]).toFixed(1)}&ndash;${Number(a[1]).toFixed(1)}`;
+  const S = D.sameSession;
+  const ortPrefill = med(S.onnxRuntime.prefillMs);
+  const ortDecode = med(S.onnxRuntime.decodeMedianMs);
+  const ourPrefill = med(S.currentEngine.prefillMs);
+  const ourDecode = med(S.currentEngine.decodeMedianMs);
+  const PE = D.bench.powerEfficiency;
+  parts.push(`<h2>Speed, against a real inference runtime</h2>
+  <p>The baseline is ONNX Runtime on this machine's CPU, running the same model. Both ran in one
+  session, alternately, under the <b>${esc(mode(S.powerMode))}</b> power mode. It still wins the
+  prompt. It no longer wins the generated tokens.</p>
+  <div class="wrap"><table>
+    <tr><th></th><th>power mode</th><th class="n">this engine</th><th class="n">ONNX Runtime</th><th class="n">ratio</th></tr>
+    <tr><td>prefill, ${S.promptTokens}-token prompt</td>${modeCell(S.powerMode)}
+        <td class="n">${ms(ourPrefill)}</td>
+        <td class="n">${ms(ortPrefill)}</td>
+        <td class="n warn">ORT ${(ourPrefill / ortPrefill).toFixed(1)}x faster</td></tr>
+    <tr><td>decode, median step</td>${modeCell(S.powerMode)}
+        <td class="n">${ms(ourDecode)}</td>
+        <td class="n">${ms(ortDecode)}</td>
+        <td class="n good">engine ${(ortDecode / ourDecode).toFixed(1)}x faster</td></tr>
+    <tr><td>decode, the engine before the fix below</td>${modeCell(S.powerMode)}
+        <td class="n">${ms(S.previousEngine.decodeMedianMs)}</td>
+        <td class="n">${ms(ortDecode)}</td>
+        <td class="n warn">ORT ${(S.previousEngine.decodeMedianMs / ortDecode).toFixed(2)}x faster</td></tr>
+  </table></div>
+  <p class="note">Medians of the session's readings. ONNX Runtime ran three times:
+  prefill ${list(S.onnxRuntime.prefillMs)} ms, decode ${list(S.onnxRuntime.decodeMedianMs)} ms.
+  The engine's decode was read twice (${list(S.currentEngine.decodeMedianMs)} ms), and its earlier
+  version once, alternated with it on the same weights. The ONNX figure is a lower bound:
+  ${esc(m.phase5.onnxRuntimeCpu.caveat)}.</p>
+  <p class="note">The power mode is not a footnote. Under <b>${esc(mode('powerEfficiency'))}</b>,
+  the machine's own setting, ONNX Runtime's decode step read
+  ${list(D.onnxRuntimeCpu.powerEfficiency.decodeMedianMs)} ms while the engine's read
+  ${ms(PE.current.decodeMedianMs)}. A CPU baseline against an integrated GPU on a laptop is partly a
+  statement about the power plan, so the comparison above is made under the mode that reproduces
+  phase 5's ONNX Runtime figures, and only within one session.</p>`);
+
+  // ------------------------------------------------------ the missing half --
+  const before = D.beforeFixProbe;
+  const after = D.afterFixProbe;
+  parts.push(`<h3>Half of every decode step was the browser creating objects</h3>
+  <p>Each generated token created about 360 bind groups and about 170 uniform buffers, and each is a
+  round trip to the browser's GPU process that has to finish before the GPU can start. Timed pass by
+  pass inside real decode steps, the GPU computed for well under the time between submitting a token
+  and its completion. Reusing those objects closed most of that gap and changed no bit of the output.
+  <a href="web/decode-profile.html">decode-profile.html</a> is the harness that measured it.</p>
+  <div class="wrap"><table>
+    <tr><th></th><th>power mode</th><th class="n">step</th><th class="n">JavaScript</th>
+        <th class="n">submit to result</th><th class="n">GPU computing</th></tr>
+    ${before.map((r) => `<tr><td>before, run ${r.run}</td>${modeCell(r.powerMode)}
+        <td class="n">${ms(r.wallMs)}</td><td class="n">${ms(r.encodeMs)}</td>
+        <td class="n">${ms(r.submitToDoneMs)}</td>
+        <td class="n">${r.inSituGpuBusyMs ? ms(r.inSituGpuBusyMs) : '&mdash;'}</td></tr>`).join('')}
+    <tr><td>after</td>${modeCell(after.powerMode)}
+        <td class="n good">${ms(after.wallMs)}</td><td class="n">${ms(after.encodeMs)}</td>
+        <td class="n">${ms(after.submitToLogitsMs)}</td><td class="n">${ms(after.inSituGpuBusyMs)}</td></tr>
+  </table></div>
+  <div class="wrap"><table>
+    <tr><th>web/bench.html, same day</th><th>power mode</th><th class="n">decode median</th><th class="n">range</th></tr>
+    <tr><td>before</td>${modeCell('powerEfficiency')}<td class="n">${ms(PE.previous.decodeMedianMs)}</td>
+        <td class="n">${span(PE.previous.decodeRangeMs)} ms</td></tr>
+    <tr><td>after</td>${modeCell('powerEfficiency')}<td class="n good">${ms(PE.current.decodeMedianMs)}</td>
+        <td class="n">${span(PE.current.decodeRangeMs)} ms</td></tr>
+  </table></div>
+  <p class="note">Ruled out on the way, each by measurement: isolated kernel timings flattered by the
+  cache, the GPU idling between passes (${span(D.hypothesesDropped.gpuIdleBetweenPasses.summedGapsMsPerToken)} ms
+  per token in all), a clock ramp within a step, and a hardware bandwidth limit. The oracle agreement
+  is unchanged to every printed digit: ${exp(D.gpuVsOracleWorstPerLayerRelative)} worst per layer,
+  ${exp(D.gpuVsOracleWorstLogitRelative)} worst logit, argmax ${D.gpuArgmaxAgreement}.</p>`);
+
+  const per = Object.entries(D.afterFixPerTokenGpuMs.kernels);
+  const peak = Math.max(...per.map(([, v]) => v));
+  const totalGpu = per.reduce((a, [, v]) => a + v, 0);
+  parts.push(`<h3>Where a decode step goes now</h3>
+  <p>Each kernel timed inside real decode steps, under
+  <b>${esc(mode(D.afterFixPerTokenGpuMs.powerMode))}</b>.</p>
+  <div class="wrap"><table>
+    <tr><th>kernel</th><th class="n">per token</th><th class="n">share</th><th></th></tr>
+    ${per.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v.toFixed(2)} ms</td>
+      <td class="n">${((v / totalGpu) * 100).toFixed(0)}%</td>
+      <td><span class="bar" style="width:${Math.max(2, (v / peak) * 200)}px"></span></td></tr>`).join('')}
+    <tr><td><b>GPU computing</b></td><td class="n"><b>${totalGpu.toFixed(1)} ms</b></td>
+        <td class="n"><b>${((totalGpu / after.wallMs) * 100).toFixed(0)}% of the step</b></td><td></td></tr>
+  </table></div>`);
+
+  // ----------------------------------------------------------- what is left --
+  const bw = D.hypothesesDropped.hardwareBandwidthLimit;
+  parts.push(`<h3>What is left</h3>
+  <p>The prompt: ${ms(ourPrefill)} against ONNX Runtime's ${ms(ortPrefill)} in the same session,
+  ${(ourPrefill / ortPrefill).toFixed(1)} times slower.</p>
+  <p>The kernels: the matrix-vector kernel reads weights at ${span(bw.matvecInSituGBs)} GB/s inside a
+  step, where a plain read on the same adapter reaches ${span(bw.pureReadCeilingGBs)} GB/s &mdash;
+  roughly half the ceiling. At the ceiling a step's weights would take ${bw.bandwidthFloorMsPerToken} ms.
+  A faster kernel would sum every output in a different order, so it would have to change the batched
+  prompt kernel in step to keep prefill and decode bit-identical, and pass the full oracle check again
+  rather than inherit this one. It has not been started.</p>`);
+
+  // ------------------------------------------------ prompt length, every path --
   const b = m.prefillBatching;
   const at = (n) => b.prefill.find((r) => r.tokens === n);
   const dec = b.decodeAfter32Tokens;
-  const prefillRate = 52 / (at(52).batchedMs / 1000);
-  const decodeRate = 1000 / dec.batchedMedianMs;
-  parts.push(`<h2>Speed, against a real inference runtime</h2>
-  <p>The baseline is ONNX Runtime on this machine's CPU running the same model. It still wins
-  the prompt, by less than it did.</p>
-  <div class="wrap"><table>
-    <tr><th></th><th class="n">this engine</th><th class="n">ONNX Runtime</th><th class="n">ratio</th></tr>
-    <tr><td>prefill, ${o.prefillTokens}-token prompt</td>
-        <td class="n">${prefillRate.toFixed(1)} tok/s</td>
-        <td class="n">${o.prefillTokensPerSecond} tok/s</td>
-        <td class="n warn">ORT ${(o.prefillTokensPerSecond / prefillRate).toFixed(1)}x</td></tr>
-    <tr><td>decode, median step</td>
-        <td class="n">${decodeRate.toFixed(1)} tok/s</td>
-        <td class="n">${o.decodeTokensPerSecond} tok/s</td>
-        <td class="n">&mdash;</td></tr>
-  </table></div>
-  <p style="color:var(--dim);font-size:0.86rem">The engine's figures come from one session with
-  about 2.4 GB of system memory free; ONNX Runtime's are from phase 5, on another day. The decode
-  kernels have not changed since phase 3, and they measured ${e.decodeMedianMs} ms then against
-  ${dec.batchedMedianMs} ms here &mdash; the same code on a different machine state, not an
-  improvement, which is why that row carries no ratio. The ONNX figure is itself a lower bound:
-  ${esc(o.caveat)}.</p>
-
-  <h3>What the prompt costs</h3>
+  parts.push(`<h3>What the prompt costs</h3>
   <p>Prefill used to read every weight once per token. It now reads each one once for up to eight
   positions, and sums every output in exactly the order the single-token kernel sums it. All three
   paths below ran on the same uploaded weights in one session, their repeats interleaved and the
-  order rotated.</p>
+  order rotated. Power mode: <b>${esc(b.powerMode)}</b>. That session came before the decode fix
+  above, so its decode row is the old path.</p>
   <div class="wrap"><table>
     <tr><th></th><th class="n">matvec</th><th class="n">tiled</th>
         <th class="n">batched, shipped</th><th class="n">vs matvec</th></tr>
@@ -176,36 +271,19 @@ try {
         <td class="n">${r.batchedMs.toFixed(0)} ms</td>
         <td class="n good">${(r.matvecMs / r.batchedMs).toFixed(2)}x</td></tr>`;
     }).join('')}
-    <tr><td>decode, median step</td>
+    <tr><td>decode, median step, before the decode fix</td>
         <td class="n">${dec.matvecMedianMs} ms</td>
         <td class="n warn">${dec.tiledMedianMs} ms</td>
         <td class="n">${dec.batchedMedianMs} ms</td>
         <td class="n">same kernel</td></tr>
   </table></div>
-  <p style="color:var(--dim);font-size:0.86rem">The batched kernel changes nothing it computes: at
-  52 tokens its logits differ from the matrix-vector kernel's in
-  <b class="good">${b.batchedVsMatvecDifferingLogitsAt52Tokens} of 151,936</b> bit patterns, and a
-  prompt run whole differs from the same prompt decoded one token at a time in
-  <b class="good">${b.prefillVsIncrementalDecodeDifferingLogits}</b>. The tiled kernel is faster on
-  the prompt and sums in a different order, which cost
+  <p class="note">The batched kernel changes nothing it computes: at 52 tokens its logits differ from
+  the matrix-vector kernel's in <b class="good">${b.batchedVsMatvecDifferingLogitsAt52Tokens} of
+  151,936</b> bit patterns, and a prompt run whole differs from the same prompt decoded one token at a
+  time in <b class="good">${b.prefillVsIncrementalDecodeDifferingLogits}</b>. The tiled kernel is
+  faster on the prompt and sums in a different order, which cost
   ${(dec.tiledMedianMs / dec.matvecMedianMs).toFixed(1)}x on every generated token; it stays in the
   code, selectable, so the gap is measured rather than remembered.</p>`);
-
-  const per = Object.entries(m.phase5.perTokenGpuMs);
-  const peak = Math.max(...per.map(([, v]) => v));
-  const totalGpu = per.reduce((a, [, v]) => a + v, 0);
-  parts.push(`<h3>Where a decode step goes, in the phase 5 session</h3>
-  <div class="wrap"><table>
-    <tr><th>kernel</th><th class="n">per token</th><th class="n">share</th><th></th></tr>
-    ${per.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v.toFixed(2)} ms</td>
-      <td class="n">${((v / totalGpu) * 100).toFixed(0)}%</td>
-      <td><span class="bar" style="width:${Math.max(2, (v / peak) * 200)}px"></span></td></tr>`).join('')}
-    <tr><td>logits readback, 608 KB</td><td class="n">${e.logitsReadbackMs} ms</td><td></td><td></td></tr>
-    <tr><td><b>unaccounted</b></td>
-        <td class="n"><b>${(e.decodeMedianMs - e.accountedGpuMs - e.logitsReadbackMs).toFixed(1)} ms</b></td>
-        <td class="n"><b>${(((e.decodeMedianMs - e.accountedGpuMs - e.logitsReadbackMs) / e.decodeMedianMs) * 100).toFixed(0)}% of the step</b></td>
-        <td></td></tr>
-  </table></div>`);
 
   // ---------------------------------------------------------- quantization --
   const q = m.phase4;
@@ -261,10 +339,10 @@ try {
   <h3>Batching 400 submissions into one did not help</h3>
   <p>Half a decode step sat outside the kernels, and the obvious culprit was submission
   overhead: a command buffer per dispatch, about 400 per token. Batching the whole forward
-  pass into one took that to ${e.submissionsPerForward}, and decode did not measurably
-  improve. The change stays, because 400 submissions per token is indefensible either way,
-  but submission count was not the bottleneck &mdash; and I would have claimed it was if I
-  had shipped the optimisation without re-measuring.</p>
+  pass into one took that to ${m.phase5.engine.submissionsPerForward}, and decode did not measurably
+  improve. Submission count was not the bottleneck &mdash; and I would have claimed it was if I
+  had shipped the optimisation without re-measuring. The half was real, though: it was the
+  objects created for every token, found later by timing every pass inside a real step.</p>
 
   <h3>The GPU cannot compute a rotation accurately enough</h3>
   <p>The rotary embedding kernel failed at ${exp(m.phase3.ropeBeforeTables)} while every

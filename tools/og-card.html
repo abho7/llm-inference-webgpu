@@ -7,9 +7,14 @@
               --force-device-scale-factor=2 --screenshot=og2x.png
               tools/og-card.html
 
+     Serve the repository (node tools/serve.js) and shoot it over HTTP with
+     --virtual-time-budget=5000, so the figures have loaded:
+     http://127.0.0.1:8099/tools/og-card.html
+
      The palette and type are this report page's own, so the preview looks
-     like the page it opens rather than like a generic banner. Every figure
-     on the card is stated and sourced on that page. -->
+     like the page it opens rather than like a generic banner. The figure line
+     is computed from golden/measurements.json exactly as the report computes
+     it, so the card cannot drift from the page. -->
 <html lang="en"><head><meta charset="utf-8">
 
 <style>
@@ -38,8 +43,18 @@
   <div class="in">
     <p class="eyebrow">llm-inference-webgpu &middot; transformer inference from scratch</p>
     <p class="head">Qwen2.5-0.5B on WebGPU. No PyTorch, no transformers, no tokenizer library.</p>
-    <p class="fig">Loses to ONNX Runtime: 5.6x prefill, 1.3x decode</p>
+    <p class="fig" id="fig">&nbsp;</p>
     <div class="rule"></div>
     <p class="foot">abho7.github.io/llm-inference-webgpu</p>
   </div>
+<script type="module">
+  const m = await (await fetch('../golden/measurements.json')).json();
+  const S = m.decodeOverhead.sameSession;
+  const med = (a) => { const v = [].concat(a).sort((x, y) => x - y); const n = v.length;
+    return n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2; };
+  const prefill = med(S.currentEngine.prefillMs) / med(S.onnxRuntime.prefillMs);
+  const decode = med(S.onnxRuntime.decodeMedianMs) / med(S.currentEngine.decodeMedianMs);
+  document.getElementById('fig').textContent =
+    `vs ONNX Runtime: ${prefill.toFixed(1)}x slower prefill, ${decode.toFixed(1)}x faster decode`;
+</script>
 </body></html>

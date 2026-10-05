@@ -106,6 +106,7 @@
  },
  "phase5": {
   "producedBy": "web/bench.html and oracle/bench_ort.py",
+  "powerMode": "not recorded",
   "engine": {
    "prefillMs": 1233,
    "prefillTokens": 52,
@@ -137,6 +138,7 @@
  },
  "prefillBatching": {
   "producedBy": "web/scaling.html (matvec, tiled and batched matvec on the same uploaded weights in one session, repeats interleaved with the order rotated), web/kernels.html, web/model.html, and a GPU-clock timing of each matrix kernel at the model's shapes",
+  "powerMode": "not recorded",
   "conditions": "about 2.4 GB of system memory free, against about 1.3 GB during the phase 5 runs; compare paths within this record, not against phase5",
   "default": "batched matvec for several positions, MATVEC for one",
   "repeats": 5,
@@ -184,7 +186,19 @@
  },
  "decodeOverhead": {
   "producedBy": "web/decode-profile.html (every compute pass timestamped inside real decode steps; modes interleaved, rotated), a same-session A/B of the previous and current engine on shared weights, web/bench.html, web/model.html, web/kernels.html, oracle/bench_ort.py",
-  "conditions": "two Windows power modes, both on AC: 'Best power efficiency' (the machine's setting) and 'Best performance' (which reproduces phase 5's ONNX Runtime figures); compare within a mode",
+  "conditions": "Windows power mode on AC, recorded per measurement as a key of powerModes; compare only within a mode",
+  "powerModes": {
+   "powerEfficiency": {
+    "label": "Best power efficiency",
+    "overlayGuid": "961cc777-2547-4f9d-8174-7d86181b8a7a",
+    "note": "the machine's own setting"
+   },
+   "bestPerformance": {
+    "label": "Best performance",
+    "overlayGuid": "ded574b5-45a0-4f42-8737-46345c09c238",
+    "note": "reproduces phase 5's ONNX Runtime figures"
+   }
+  },
   "timestampsQuantized": false,
   "hypothesesDropped": {
    "isolatedTableFlatteredByCache": "same kernel over 24 layers' weights within 1-5% of same weights",
@@ -197,7 +211,7 @@
    "clockRampWithinStep": "gate_proj flat across 24 layers, within 3%",
    "hardwareBandwidthLimit": {
     "pureReadCeilingGBs": [
-     58.9,
+     57.3,
      60.4
     ],
     "matvecInSituGBs": [
@@ -205,7 +219,8 @@
      35.5
     ],
     "bandwidthFloorMsPerToken": 16.7
-   }
+   },
+   "powerMode": "powerEfficiency"
   },
   "readback": {
    "perStepMs": [
@@ -219,7 +234,8 @@
    "logits608KBMs": [
     4.07,
     5.23
-   ]
+   ],
+   "powerMode": "powerEfficiency"
   },
   "beforeFixProbe": [
    {
@@ -227,10 +243,12 @@
     "wallMs": 78.83,
     "encodeMs": 7.48,
     "submitToDoneMs": 64.72,
+    "inSituGpuBusyMs": 45.55,
     "reusedWallMs": 56.19,
     "reusedEncodeMs": 1.94,
     "reusedSubmitToDoneMs": 48.46,
-    "reusedGpuBusyMs": 39.23
+    "reusedGpuBusyMs": 39.23,
+    "powerMode": "powerEfficiency"
    },
    {
     "run": 2,
@@ -241,7 +259,8 @@
     "reusedWallMs": 62.65,
     "reusedEncodeMs": 1.98,
     "reusedSubmitToDoneMs": 53.63,
-    "reusedGpuBusyMs": 42.43
+    "reusedGpuBusyMs": 42.43,
+    "powerMode": "powerEfficiency"
    }
   ],
   "sameSessionAB": {
@@ -295,57 +314,61 @@
    "currentStepRangeMs": [
     44.47,
     70.06
+   ],
+   "powerModeByRun": [
+    "powerEfficiency",
+    "powerEfficiency",
+    "bestPerformance"
    ]
   },
   "bench": {
    "powerEfficiency": {
-    "previousDecodeMedianMs": 110.2,
-    "previousRangeMs": [
-     96.0,
-     154.9
-    ],
-    "currentDecodeMedianMs": 48.9,
-    "currentRangeMs": [
-     46.3,
-     52.2
-    ],
-    "currentAccountedGpuMs": 34.5
+    "previous": {
+     "decodeMedianMs": 110.2,
+     "decodeRangeMs": [
+      96.0,
+      154.9
+     ]
+    },
+    "current": {
+     "decodeMedianMs": 48.9,
+     "decodeRangeMs": [
+      46.3,
+      52.2
+     ],
+     "accountedGpuMs": 34.5
+    }
    },
    "bestPerformance": {
-    "currentDecodeMedianMs": 53.3,
-    "currentRangeMs": [
-     46.9,
-     61.6
-    ],
-    "currentPrefillMs": 964
+    "current": {
+     "decodeMedianMs": 53.3,
+     "decodeRangeMs": [
+      46.9,
+      61.6
+     ],
+     "prefillMs": 964
+    }
    }
   },
   "onnxRuntimeCpu": {
-   "powerEfficiencyDecodeMedianMs": [
-    244.7,
-    249.0
-   ],
-   "bestPerformanceDecodeMedianMs": [
-    73.7,
-    73.0,
-    83.4
-   ],
-   "bestPerformancePrefillMs": [
-    214.9,
-    230.9,
-    425.7
-   ]
-  },
-  "bestPerformanceSameSession": {
-   "onnxRuntimeDecodeMs": [
-    73.0,
-    83.4
-   ],
-   "previousEngineDecodeMedianMs": 82.75,
-   "currentEngineDecodeMs": [
-    52.7,
-    53.3
-   ]
+   "powerEfficiency": {
+    "decodeMedianMs": [
+     244.7,
+     249.0
+    ]
+   },
+   "bestPerformance": {
+    "decodeMedianMs": [
+     73.7,
+     73.0,
+     83.4
+    ],
+    "prefillMs": [
+     214.9,
+     230.9,
+     425.7
+    ]
+   }
   },
   "gpuVsOracleWorstPerLayerRelative": 6.43e-05,
   "gpuVsOracleWorstLogitRelative": 4.74e-06,
@@ -353,7 +376,68 @@
   "prefillVsIncrementalDecodeDifferingLogits": 0,
   "kernelComparisonsPassing": "24/24",
   "notShipped": {
-   "singleComputePass": "5 ms faster on the final code in one run; before the fix it read +8 ms and -12 ms"
+   "singleComputePass": {
+    "powerMode": "powerEfficiency",
+    "note": "5 ms faster on the final code in one run; before the fix it read +8 ms and -12 ms"
+   }
+  },
+  "afterFixProbe": {
+   "powerMode": "powerEfficiency",
+   "wallMs": 54.68,
+   "encodeMs": 5.28,
+   "submitToLogitsMs": 50.32,
+   "inSituGpuBusyMs": 35.78
+  },
+  "afterFixPerTokenGpuMs": {
+   "powerMode": "powerEfficiency",
+   "producedBy": "web/decode-profile.html, every pass timestamped inside real decode steps",
+   "kernels": {
+    "gate/up (4864x896, twice per layer)": 13.93,
+    "lm_head (151936x896, once per token)": 8.94,
+    "down (896x4864)": 5.9,
+    "attention": 1.62,
+    "q_proj (896x896)": 1.5,
+    "o_proj (896x896)": 1.49,
+    "rmsnorm, k/v_proj, rope, swiglu, add": 1.51
+   }
+  },
+  "sameSession": {
+   "powerMode": "bestPerformance",
+   "note": "ONNX Runtime and the engine run alternately in one session: ORT, bench.html, ORT, A/B, ORT",
+   "promptTokens": 52,
+   "onnxRuntime": {
+    "decodeMedianMs": [
+     73.7,
+     73.0,
+     83.4
+    ],
+    "prefillMs": [
+     214.9,
+     230.9,
+     425.7
+    ]
+   },
+   "previousEngine": {
+    "decodeMedianMs": 82.75,
+    "decodeRoundMediansMs": [
+     86.1,
+     93.1,
+     68.1,
+     69.6
+    ]
+   },
+   "currentEngine": {
+    "decodeMedianMs": [
+     53.3,
+     52.72
+    ],
+    "prefillMs": 964
+   }
+  },
+  "whatIsLeft": {
+   "prefillVsOnnxRuntime": "964 ms against 214.9-230.9 ms in the same session, 4.2-4.5x",
+   "matvecFractionOfReadCeiling": "about half: 20-35 GB/s in situ against 57-60 GB/s",
+   "fasterKernelCaveat": "a faster matrix-vector kernel changes the order every output is summed in, so it must change batchedMatvec in step and re-pass the full oracle check"
   }
  }
 }

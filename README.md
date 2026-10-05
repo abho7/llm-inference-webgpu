@@ -16,13 +16,22 @@ quantization are all in this repository.
 > **Status: all six phases done.** The engine loads the weights, tokenizes
 > exactly, agrees with ONNX Runtime per layer, caches keys and values without
 > changing a bit, runs on the GPU, quantizes to 8 and 4 bits with the damage
-> measured, loses to ONNX Runtime by a measured margin, and is deployed.
+> measured, was benchmarked against ONNX Runtime and lost to it by a measured
+> margin, and is deployed.
 >
 > **Since then**, prefill reads each weight once for up to eight positions
 > rather than once per position: 1.4 to 1.75 times faster from 8 tokens up,
-> with decode unchanged and every logit still bit-identical to what the
+> without slowing decode and with every logit still bit-identical to what the
 > matrix-vector engine produced.
 > [How, and the two attempts that came first](#after-phase-6-batching-the-prefill-without-changing-a-bit).
+>
+> **And decode** no longer loses to ONNX Runtime. Half of each decode step was
+> the browser creating objects, not the GPU computing; reusing them takes a
+> step from 77-110 ms to 49-53 ms, again without changing a bit. Measured in
+> the same session, decode is now 1.4 to 1.6 times faster than ONNX Runtime;
+> prefill is still 4.2 to 4.5 times slower.
+> [What the missing half was](#after-phase-6-the-missing-half-of-a-decode-step),
+> and [what is left](#whats-left).
 >
 > **[Live demo](https://abho7.github.io/llm-inference-webgpu/web/demo.html)** --
 > runs in your browser, streaming the weights from Hugging Face.
@@ -44,6 +53,140 @@ already do that. The claims worth making are narrower and checkable:
 | 6 | Quantization error is characterised per layer, not just end to end | 4 | **done** |
 | 7 | Throughput and time-to-first-token, measured, against a baseline | 5 | **done** |
 | 8 | It runs, in public, in someone else's browser | 6 | **done** |
+
+## After phase 6: the missing half of a decode step
+
+Phase 5 left decode 1.3 times slower than ONNX Runtime, with 51% of a step
+outside every kernel, and one explanation for that -- submission count --
+already measured and dropped. This is what the other half was.
+
+### Seven hypotheses, written down before any were tested
+
+`web/decode-profile.html` wraps the shipping engine without editing it and
+puts a timestamp pair on every one of the 362 compute passes *inside* real
+decode steps, rather than timing each kernel alone as `web/bench.html` does.
+It splits a step's wall time into JavaScript encoding, submit-to-done and
+readback, times each matrix kernel both alone and inside a step, and measures
+what a pure coalesced read of a 272 MB buffer reaches on this adapter. Every
+step decodes the same token at the same position, the modes are interleaved
+with the order rotated, and every step's logits are compared bitwise against
+the first. Two full runs; a claim below holds in both or is not made.
+
+| hypothesis | measurement | verdict |
+|---|---|---|
+| the isolated per-kernel table is flattered by the cache: 256 repeats over the same 1.6 MB matrix stay in the 12 MB LLC | the same kernel rotated across all 24 layers' weights times within 1-5% of the same-weights figure; inside real steps the matrix kernels ran within 5% of their isolated times in two runs and 28% slower in one | **dropped** |
+| the GPU idles between passes | every gap between consecutive passes inside a step, summed: 0.32-0.39 ms per token | **dropped** |
+| the GPU clock ramps up during a step | gate_proj's time is flat across the 24 layers of a step, within 3%, in every run | **dropped** |
+| the integrated GPU is simply bandwidth-bound | a pure read with vector loads reaches 57-60 GB/s; MATVEC reaches 20-35 GB/s. At the ceiling, 988 MB of weights is a 17 ms step | **dropped** as the explanation -- but see the last section |
+| readback stalls | 5.2-5.5 ms per step, of which 3.6-4.6 ms is a fixed round trip: mapping 4 bytes costs nearly what 608 KB does | **partly** |
+| per-step object creation | see below | **the cause** |
+| the comparison itself | see below | **it moves by 3.3x** |
+
+### What it was: 530 objects per token
+
+A decode step records 362 dispatches, and each one created a fresh bind
+group. Every matrix product, norm, rope and attention call also created a
+fresh uniform buffer for its parameters -- about 170 per token, none ever
+destroyed. In WebGPU each of those is a message to the browser's GPU process,
+which has to carry it out before it can start on the command buffer that
+uses it.
+
+| | wall | JavaScript encode | submit to done | GPU busy, in situ |
+|---|---|---|---|---|
+| shipping path, run 1 | 78.8 ms | 7.5 ms | 64.7 ms | 37-46 ms |
+| shipping path, run 2 | 77.1 ms | 7.1 ms | 64.4 ms | 38 ms |
+| bind groups and uniforms reused, run 1 | 56.2 ms | 1.9 ms | 48.5 ms | 39 ms |
+| bind groups and uniforms reused, run 2 | 62.7 ms | 2.0 ms | 53.6 ms | 42 ms |
+
+The GPU was executing for under 40 ms of the 64 ms between submitting a
+decode step and its completion. Batching the submissions in phase 5 could not
+have helped, because the cost was never the submissions: it was everything the
+GPU process had to create before the one submission could run. Reusing the
+objects removes 14-23 ms in each run: 5 to 5.5 ms of JavaScript, and 11 to
+16 ms off the time between submitting a step and its completion.
+
+### What shipped, and what it cost in bits: none
+
+- `GpuContext.bindGroup()` caches bind groups by pipeline and buffer
+  identity; a replaced buffer gets a new identity rather than a stale group.
+- `GpuModel` keeps a pool of uniform buffers, slot *i* for the *i*-th
+  parameter block of a pass, rewritten each pass. A slot is written once per
+  pass and each write is queued after the previous pass's submission, so no
+  pass sees the next one's parameters.
+- The logits copy is recorded into the forward pass's own command buffer, so
+  mapping it is the only wait, instead of waiting for the pass and then
+  submitting and waiting for a copy.
+- The attention scores buffer grows in blocks of 256 positions. It used to be
+  grown to the exact length, which during decode meant replacing it -- and
+  every bind group holding it -- on every token.
+
+None of this touches arithmetic, and that was checked rather than argued. The
+previous engine and this one ran on the same uploaded weights in the same
+session, alternating steps, each generating its own 65-token greedy
+continuation: **0 of 9,875,840 logits differed**, in each of three runs. (The
+scores-buffer change came after those runs; the gates below cover it.)
+`web/model.html` reproduces the oracle comparison to every printed digit --
+6.43e-5 worst per layer, 4.74e-6 worst logit, argmax 5/5, prefill against
+incremental decode bit-identical -- and `web/kernels.html` passes 24 of 24.
+
+| `web/bench.html`, same day | decode median | range over 32 steps |
+|---|---|---|
+| before | 110.2 ms | 96.0-154.9 ms |
+| after | 48.9 ms | 46.3-52.2 ms |
+
+The "before" figure was the worst of the day: the previous engine's step,
+alternated against the new one, ran from 68 to 115 ms by round medians across
+three sessions, while the new one stayed at 50-56 ms in every round of every
+run. So the fair claim is 1.3 to 2.2 times faster, with a much narrower
+spread: 44-70 ms across every alternated step, against 53-157 ms. Phase 5 put decode's run-to-run spread down to memory
+residency; that the spread mostly went away with the object churn suggests
+much of it was not residency at all.
+
+### The baseline moved more than the engine did
+
+ONNX Runtime was re-measured the same day, and its first reading was 245 ms
+per decode step against phase 5's 67.5. The cause was Windows' power mode,
+which was on *Best power efficiency*. Under *Best performance* it read 73.0,
+73.7 and 83.4 ms, interleaved with the engine runs, and its 215-231 ms prefill
+agreed with phase 5's 218. The engine barely noticed the switch: 49-53 ms
+under either mode. So the ratio between a CPU baseline and an integrated-GPU
+engine on a laptop is partly a statement about the power plan, and the
+comparison below is made under the mode that reproduces phase 5's baseline.
+
+| *Best performance*, same session | decode median |
+|---|---|
+| ONNX Runtime (CPU) | 73.0-83.4 ms |
+| previous engine | 82.8 ms (round medians 68-93 ms) |
+| this engine | 52.7-53.3 ms |
+
+Decode is now 1.4 to 1.6 times faster than ONNX Runtime on this machine,
+where it was 1.0 to 1.3 times slower. Prefill is still a loss, by 4.2 to 4.5
+times; see [what's left](#whats-left).
+
+### What's left
+
+**Prefill is still 4.2 to 4.5 times slower than ONNX Runtime**: 964 ms against
+214.9 and 230.9 ms in the same session. A third ONNX Runtime reading, 425.7 ms,
+was an outlier and is recorded rather than used; counting it would flatter the
+engine.
+
+**The matrix-vector kernel runs at roughly half the bandwidth ceiling.** Of a
+50 ms decode step, about 36 ms is the GPU computing. MATVEC reads weights at
+20-35 GB/s inside a step, where a plain read on the same adapter reaches
+57-60 GB/s; at the ceiling, 988 MB of weights would take 17 ms. It loads one
+f16 per thread per iteration, and the 896-row projections give it only 896
+workgroups. So the remaining decode gap is a kernel, not the hardware.
+
+A faster kernel would sum every output in a different order. It would have to
+change batchedMatvec in step to keep prefill and decode bit-identical, and it
+would need the full oracle check again -- per layer, logits and argmax against
+ONNX Runtime, plus `web/kernels.html` -- rather than inherit the agreement the
+current kernel earned. It has not been started.
+
+Recording every dispatch between copies into one compute pass, rather than one
+pass per dispatch, read 5 ms faster on the final code. Before the object churn
+was removed the same change read 8 ms faster in one run and 12 ms slower in
+the other, so it has one clean reading and is not in.
 
 ## After phase 6: batching the prefill without changing a bit
 
@@ -192,6 +335,12 @@ opponent.
 | prefill, 52-token prompt | 1233 ms, **42 tok/s** | 218 ms, **238 tok/s** | ORT 5.6x faster |
 | decode, median step | 86.8 ms, **11.5 tok/s** | 67.5 ms, **14.8 tok/s** | ORT 1.3x faster |
 
+These are phase 5's figures, kept as the record of that phase, and its power
+mode was not recorded. Both rows have since moved: prefill batching made the
+prompt 1.4 to 1.75 times faster, and removing the per-token object churn made
+decode faster than ONNX Runtime in the same session. See
+[the missing half of a decode step](#after-phase-6-the-missing-half-of-a-decode-step).
+
 So it loses, and the prefill gap is the larger one. That is not mysterious:
 prefill here runs a matrix-*vector* product per position, with the sequence in
 the third dispatch dimension, rather than a real matrix multiply. One kernel
@@ -229,6 +378,9 @@ raw pass totals.
 | measured decode step | 86.8 ms |
 | **unaccounted** | **44.5 ms (51%)** |
 
+The unaccounted half was later found and removed: it was the browser creating
+about 530 GPU objects per token. [Where the time goes now](#after-phase-6-the-missing-half-of-a-decode-step).
+
 The MLP is 56% of GPU time across three matrices, and the output projection
 alone is a quarter -- worth remembering that this model ties its embeddings, so
 that 151936x896 matrix is 27% of the parameters and gets read once per token to
@@ -246,7 +398,9 @@ at 175, 151, 141 and 87 ms, with the two fastest and the slowest both on the
 batched code. The change is still in -- 400 submissions per token is
 indefensible regardless -- but the honest conclusion is that submission count
 was not the bottleneck, and I would have reported it as one if I had shipped the
-optimisation without re-measuring.
+optimisation without re-measuring. What the half actually was came later, from
+timing every pass inside a real step:
+[the objects created per token](#after-phase-6-the-missing-half-of-a-decode-step).
 
 ### The numbers move, and pretending otherwise would be worse
 
@@ -482,6 +636,7 @@ node tools/serve.js                       # serves the repo with HTTP range supp
 #   /web/perplexity.html perplexity under each quantization scheme
 #   /web/bench.html      throughput, time to first token, per-kernel breakdown
 #   /web/scaling.html    prefill and decode across prompt lengths, every matrix path
+#   /web/decode-profile.html  every pass timed inside real decode steps, and the read ceiling
 ```
 
 Range support is not incidental: the weights are 988 MB and the page needs
@@ -713,7 +868,8 @@ would have been. It is already confirmed working end to end: a greedy decode of
 src/core/     backend-agnostic: dtypes, safetensors, config, tokenizer, quantization
 src/cpu/      the reference forward pass and KV cache
 src/gpu/      WebGPU device plumbing and the WGSL kernels
-web/          browser harnesses: probe, kernels, precision, model, perplexity, bench, scaling, demo
+web/          browser harnesses: probe, kernels, precision, model, perplexity, bench, scaling,
+              decode-profile, demo
 tools/        a static server with range support, for the browser harnesses
 oracle/       independent implementations, used only to generate golden files
 golden/       committed outputs of the oracle scripts
