@@ -181,5 +181,179 @@
    }
   },
   "deployed": true
+ },
+ "decodeOverhead": {
+  "producedBy": "web/decode-profile.html (every compute pass timestamped inside real decode steps; modes interleaved, rotated), a same-session A/B of the previous and current engine on shared weights, web/bench.html, web/model.html, web/kernels.html, oracle/bench_ort.py",
+  "conditions": "two Windows power modes, both on AC: 'Best power efficiency' (the machine's setting) and 'Best performance' (which reproduces phase 5's ONNX Runtime figures); compare within a mode",
+  "timestampsQuantized": false,
+  "hypothesesDropped": {
+   "isolatedTableFlatteredByCache": "same kernel over 24 layers' weights within 1-5% of same weights",
+   "gpuIdleBetweenPasses": {
+    "summedGapsMsPerToken": [
+     0.32,
+     0.39
+    ]
+   },
+   "clockRampWithinStep": "gate_proj flat across 24 layers, within 3%",
+   "hardwareBandwidthLimit": {
+    "pureReadCeilingGBs": [
+     58.9,
+     60.4
+    ],
+    "matvecInSituGBs": [
+     19.9,
+     35.5
+    ],
+    "bandwidthFloorMsPerToken": 16.7
+   }
+  },
+  "readback": {
+   "perStepMs": [
+    5.15,
+    5.56
+   ],
+   "fixedRoundTrip4BytesMs": [
+    3.62,
+    4.56
+   ],
+   "logits608KBMs": [
+    4.07,
+    5.23
+   ]
+  },
+  "beforeFixProbe": [
+   {
+    "run": 1,
+    "wallMs": 78.83,
+    "encodeMs": 7.48,
+    "submitToDoneMs": 64.72,
+    "reusedWallMs": 56.19,
+    "reusedEncodeMs": 1.94,
+    "reusedSubmitToDoneMs": 48.46,
+    "reusedGpuBusyMs": 39.23
+   },
+   {
+    "run": 2,
+    "wallMs": 77.08,
+    "encodeMs": 7.1,
+    "submitToDoneMs": 64.43,
+    "inSituGpuBusyMs": 37.56,
+    "reusedWallMs": 62.65,
+    "reusedEncodeMs": 1.98,
+    "reusedSubmitToDoneMs": 53.63,
+    "reusedGpuBusyMs": 42.43
+   }
+  ],
+  "sameSessionAB": {
+   "differingLogits": 0,
+   "comparedLogitsPerRun": 9875840,
+   "runs": 3,
+   "previousRoundMediansMs": [
+    [
+     108.5,
+     114.9,
+     73.2,
+     70.9
+    ],
+    [
+     110.1,
+     100.9,
+     97.3,
+     101.4
+    ],
+    [
+     86.1,
+     93.1,
+     68.1,
+     69.6
+    ]
+   ],
+   "currentRoundMediansMs": [
+    [
+     51.5,
+     54.7,
+     52.0,
+     50.6
+    ],
+    [
+     53.3,
+     52.3,
+     50.2,
+     51.8
+    ],
+    [
+     50.3,
+     56.2,
+     50.6,
+     55.7
+    ]
+   ],
+   "previousStepRangeMs": [
+    52.96,
+    156.78
+   ],
+   "currentStepRangeMs": [
+    44.47,
+    70.06
+   ]
+  },
+  "bench": {
+   "powerEfficiency": {
+    "previousDecodeMedianMs": 110.2,
+    "previousRangeMs": [
+     96.0,
+     154.9
+    ],
+    "currentDecodeMedianMs": 48.9,
+    "currentRangeMs": [
+     46.3,
+     52.2
+    ],
+    "currentAccountedGpuMs": 34.5
+   },
+   "bestPerformance": {
+    "currentDecodeMedianMs": 53.3,
+    "currentRangeMs": [
+     46.9,
+     61.6
+    ],
+    "currentPrefillMs": 964
+   }
+  },
+  "onnxRuntimeCpu": {
+   "powerEfficiencyDecodeMedianMs": [
+    244.7,
+    249.0
+   ],
+   "bestPerformanceDecodeMedianMs": [
+    73.7,
+    73.0,
+    83.4
+   ],
+   "bestPerformancePrefillMs": [
+    214.9,
+    230.9,
+    425.7
+   ]
+  },
+  "bestPerformanceSameSession": {
+   "onnxRuntimeDecodeMs": [
+    73.0,
+    83.4
+   ],
+   "previousEngineDecodeMedianMs": 82.75,
+   "currentEngineDecodeMs": [
+    52.7,
+    53.3
+   ]
+  },
+  "gpuVsOracleWorstPerLayerRelative": 6.43e-05,
+  "gpuVsOracleWorstLogitRelative": 4.74e-06,
+  "gpuArgmaxAgreement": "5/5",
+  "prefillVsIncrementalDecodeDifferingLogits": 0,
+  "kernelComparisonsPassing": "24/24",
+  "notShipped": {
+   "singleComputePass": "5 ms faster on the final code in one run; before the fix it read +8 ms and -12 ms"
+  }
  }
 }

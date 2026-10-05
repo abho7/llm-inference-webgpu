@@ -34,6 +34,14 @@ export class GpuContext {
     // When set, dispatch() records into this encoder instead of submitting.
     this.recording = null;
     this.submissions = 0;
+    // Bind groups, reused across calls that bind the same buffers to the same
+    // pipeline. Creating ~360 of them per decode step, each a round trip into
+    // the browser's GPU process before the GPU can start, measured at 3.5 ms
+    // of JavaScript and several more of GPU-process time per token.
+    this.bindGroups = new Map();
+    this.bufferIds = new WeakMap();
+    this.nextBufferId = 0;
+    this.staging = null;
   }
 
   static async create({ requireF16 = true } = {}) {
@@ -135,10 +143,11 @@ export class GpuContext {
    * Start recording. Until flush(), dispatch() and copy() append to a single
    * command encoder rather than submitting one at a time.
    *
-   * This matters more than it sounds. A decode step is about 360 dispatches,
-   * and submitting each one separately means 360 round trips into the driver
-   * for roughly 100 microseconds of actual work apiece. Measurement put 77% of
-   * a decode step outside the kernels; this is where that went.
+   * A decode step is about 360 dispatches, and submitting each separately is
+   * 360 round trips into the driver. Batching them did not measurably speed
+   * decode up, though: the time outside the kernels was the objects created
+   * per dispatch, not the submissions. See bindGroup() and GpuModel's
+   * uniform pool.
    */
   begin(label = 'forward') {
     if (this.recording) throw new Error('already recording');
@@ -167,13 +176,39 @@ export class GpuContext {
     this.submissions++;
   }
 
+  /**
+   * A bind group for `buffers` on `pipeline`, created once and then reused.
+   *
+   * Keyed by the identity of every buffer, so a buffer that is destroyed and
+   * replaced gets a new key rather than a stale group. The cache is bounded:
+   * a harness that makes fresh buffers per call would otherwise grow it
+   * without limit, so past a few thousand entries it is simply dropped.
+   */
+  bindGroup(pipeline, buffers) {
+    const ids = buffers.map((buffer) => {
+      let id = this.bufferIds.get(buffer);
+      if (id === undefined) { id = this.nextBufferId++; this.bufferIds.set(buffer, id); }
+      return id;
+    });
+    let byPipeline = this.bindGroups.get(pipeline);
+    if (!byPipeline) { byPipeline = new Map(); this.bindGroups.set(pipeline, byPipeline); }
+    const key = ids.join(',');
+    let group = byPipeline.get(key);
+    if (!group) {
+      if (byPipeline.size >= 4096) byPipeline.clear();
+      group = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+      });
+      byPipeline.set(key, group);
+    }
+    return group;
+  }
+
   /** Run one kernel over `buffers`, dispatching a grid of workgroups. */
   dispatch(code, buffers, grid, label = 'kernel') {
     const pipeline = this.pipeline(code, label);
-    const bindGroup = this.device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
-    });
+    const bindGroup = this.bindGroup(pipeline, buffers);
     const encoder = this.recording ?? this.device.createCommandEncoder({ label });
     const pass = encoder.beginComputePass({ label });
     pass.setPipeline(pipeline);
@@ -201,6 +236,37 @@ export class GpuContext {
     staging.unmap();
     staging.destroy();
     return out.subarray(0, floatCount);
+  }
+
+  /**
+   * Record a copy of `buffer` into a staging buffer as part of the current
+   * recording, and return a function that maps it once the recording has been
+   * flushed.
+   *
+   * readF32() submits its own copy and then maps, and callers wait for the
+   * forward pass to finish before calling it: two round trips to the GPU
+   * process where one will do. Mapping waits for the copy, and the copy is
+   * ordered after everything recorded before it, so the map alone is the
+   * wait. The staging buffer is kept and reused; it is unmapped before the
+   * returned function resolves, so the next call finds it free.
+   */
+  stageRead(buffer, floatCount) {
+    if (!this.recording) throw new Error('stageRead() needs an open recording');
+    const bytes = align4(floatCount * 4);
+    if (!this.staging || this.staging.size < bytes) {
+      if (this.staging) this.staging.destroy();
+      this.staging = this.device.createBuffer({
+        label: 'staging', size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+    }
+    const staging = this.staging;
+    this.recording.copyBufferToBuffer(buffer, 0, staging, 0, bytes);
+    return async () => {
+      await staging.mapAsync(GPUMapMode.READ, 0, bytes);
+      const out = new Float32Array(staging.getMappedRange(0, bytes).slice(0, floatCount * 4));
+      staging.unmap();
+      return out;
+    };
   }
 
   async done() { await this.device.queue.onSubmittedWorkDone(); }

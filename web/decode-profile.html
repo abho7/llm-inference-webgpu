@@ -1,0 +1,364 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Decode profile</title>
+<style>
+  body { font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem; max-width: 72rem; }
+  pre { font-size: 12px; }
+</style>
+<h1>Where a decode step goes, measured inside the step</h1>
+<p>bench.html times each kernel in isolation, 256 times over the same weights. This page
+times every compute pass inside real decode steps, and splits the wall time of a step into
+encode, GPU and readback. Every step decodes the same token at the same position, so the
+modes compare like for like.</p>
+<div id="log">starting...</div>
+<pre id="out"></pre>
+
+<script type="module">
+import { GpuContext, grid2d } from '../src/gpu/device.js';
+import { GpuModel } from '../src/gpu/model.js';
+import { MATVEC } from '../src/gpu/kernels.js';
+import { Safetensors } from '../src/core/safetensors.js';
+import { FetchSource } from '../src/core/source-web.js';
+import { ModelConfig } from '../src/core/config.js';
+import { Tokenizer } from '../src/core/tokenizer.js';
+import { bf16ToF32Array } from '../src/core/dtype.js';
+
+const log = document.getElementById('log');
+const out = document.getElementById('out');
+const say = (m) => { log.textContent = m; console.log('[profile]', m); };
+const print = (m) => { out.textContent += m + '\n'; };
+const median = (a) => { const s = [...a].sort((x, y) => x - y); const n = s.length;
+  return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2; };
+const params = new URLSearchParams(location.search);
+const STEPS = Number(params.get('steps') ?? 12);
+const ROUNDS = Number(params.get('rounds') ?? 3);
+
+// Per-layer dispatch order in GpuModel.forward, used to name each timed pass.
+const LAYER_ORDER = ['rmsnorm', 'q_proj', 'k_proj', 'v_proj', 'rope-q', 'rope-k', 'attention',
+  'o_proj', 'residual', 'rmsnorm2', 'gate', 'up', 'swiglu', 'down', 'residual2'];
+
+try {
+  const base = '..';
+  const config = ModelConfig.parse(await (await fetch(`${base}/weights/config.json`)).text());
+  const tokenizer = Tokenizer.fromJSON(await (await fetch(`${base}/weights/tokenizer.json`)).text());
+  const st = await Safetensors.open(await FetchSource.open(`${base}/weights/model.safetensors`));
+  const ctx = await GpuContext.create();
+  const dev = ctx.device;
+  const d = config.hiddenSize;
+
+  say('uploading weights...');
+  const model = await GpuModel.load(ctx, st, config, { maxPositions: 1024 });
+  await ctx.assertShadersCompiled();
+
+  async function embed(ids) {
+    const arr = new Float32Array(ids.length * d);
+    for (let t = 0; t < ids.length; t++) {
+      const bytes = await st.readRawRange('model.embed_tokens.weight', ids[t] * d * 2, d * 2);
+      const aligned = bytes.byteOffset % 2 === 0 ? bytes : new Uint8Array(bytes);
+      arr.set(bf16ToF32Array(new Uint16Array(aligned.buffer, aligned.byteOffset, d)), t * d);
+    }
+    return arr;
+  }
+
+  const PROMPT = 'The theory of computation asks what problems can be solved by machines, '
+    + 'and how much time and memory the solutions need. A Turing machine is deliberately '
+    + 'impoverished: a tape, a head that reads and writes one symbol at a time, and a '
+    + 'finite table of rules.';
+  const ids = tokenizer.encode(PROMPT);
+  const cache = model.newCache(ids.length + 8);
+  const first = await model.forward(await embed(ids), ids.length, { cache, wantLogits: true });
+  let token = 0;
+  for (let i = 1; i < first.logits.length; i++) if (first.logits[i] > first.logits[token]) token = i;
+  const row = await embed([token]);
+  const P = ids.length;
+
+  // ---------------------------------------------------------- instrumentation --
+  // Wrap the context rather than edit src/: the engine under test is the engine
+  // that ships. Modes:
+  //   plain     the shipping code path, timed by wall clock only
+  //   stamped   a timestamp pair on every compute pass (one pass per dispatch)
+  //   onepass   every dispatch between copies recorded into one compute pass
+  // An earlier version also had a mode reusing bind groups and uniforms across
+  // steps; that is now what the shipping path does.
+  const MAXQ = 4096;
+  const querySet = dev.createQuerySet({ type: 'timestamp', count: MAXQ });
+  const resolveBuf = dev.createBuffer({ size: MAXQ * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+  const prof = { mode: 'plain', n: 0, pass: null, marks: {} };
+
+  const origDispatch = ctx.dispatch.bind(ctx);
+  const origCopy = ctx.copy.bind(ctx);
+  const origFlush = ctx.flush.bind(ctx);
+  const origDone = ctx.done.bind(ctx);
+  const origRead = ctx.readF32.bind(ctx);
+
+  const endPass = () => {
+    if (!prof.pass) return;
+    prof.pass.end();
+    prof.pass = null;
+  };
+  ctx.dispatch = function (code, buffers, grid, label = 'kernel') {
+    if (prof.mode === 'plain' || !this.recording) return origDispatch(code, buffers, grid, label);
+    const pipeline = this.pipeline(code, label);
+    const bg = this.bindGroup(pipeline, buffers);
+    if (prof.mode === 'stamped') {
+      const i = prof.n;
+      const pass = this.recording.beginComputePass({ label, timestampWrites: {
+        querySet, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 } });
+      pass.setPipeline(pipeline); pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(grid[0], grid[1] ?? 1, grid[2] ?? 1);
+      pass.end();
+    } else {
+      if (!prof.pass) {
+        const i = prof.segments++;
+        prof.pass = this.recording.beginComputePass({ label: 'seg', timestampWrites: {
+          querySet, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 } });
+      }
+      prof.pass.setPipeline(pipeline); prof.pass.setBindGroup(0, bg);
+      prof.pass.dispatchWorkgroups(grid[0], grid[1] ?? 1, grid[2] ?? 1);
+    }
+    prof.n++;
+  };
+  ctx.copy = function (...args) { if (prof.mode !== 'plain') endPass(); return origCopy(...args); };
+  ctx.flush = function () {
+    if (prof.mode !== 'plain') endPass();
+    if (this.recording && prof.marks.flush === undefined) prof.marks.flush = performance.now();
+    return origFlush();
+  };
+  // The forward pass reads its logits through stageRead(); the mark goes on
+  // the returned map, so 'readback' is the wait after the GPU signalled done.
+  const origStage = ctx.stageRead.bind(ctx);
+  ctx.stageRead = function (b, n) {
+    if (prof.mode !== 'plain') endPass();
+    const read = origStage(b, n);
+    return async () => { const r = await read(); prof.marks.read = performance.now(); return r; };
+  };
+
+  async function readStamps(count) {
+    const staging = dev.createBuffer({ size: count * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = dev.createCommandEncoder();
+    enc.resolveQuerySet(querySet, 0, count, resolveBuf, 0);
+    enc.copyBufferToBuffer(resolveBuf, 0, staging, 0, count * 8);
+    dev.queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const s = new BigInt64Array(staging.getMappedRange().slice(0));
+    staging.unmap(); staging.destroy();
+    return s;
+  }
+
+  let reference = null;
+  async function step(mode) {
+    prof.mode = mode; prof.n = 0; prof.segments = 0; prof.marks = {};
+    cache.length = P;                     // same position every step
+    // An invalid command buffer is not an exception: the map still resolves,
+    // with whatever the staging buffer held last -- here the previous step's
+    // identical logits, which the bitwise check below would pass. So a
+    // validation error anywhere in the step is checked for explicitly.
+    dev.pushErrorScope('validation');
+    const t0 = performance.now();
+    const { logits } = await model.forward(row, 1, { cache, wantLogits: true });
+    const t1 = performance.now();
+    const invalid = await dev.popErrorScope();
+    if (invalid) throw new Error(`${mode}: ${invalid.message}`);
+    // The modes must not change a bit of the answer.
+    if (!reference) reference = logits.slice();
+    else {
+      const a = new Uint32Array(reference.buffer), b = new Uint32Array(logits.buffer, logits.byteOffset, logits.length);
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) throw new Error(`${mode}: logit ${i} differs`);
+    }
+    const r = { mode, wall: t1 - t0, encode: prof.marks.flush - t0,
+      // Submit until the logits are mapped: the GPU's work, the browser's
+      // GPU-process work before it, and the map, which is the only wait.
+      submitToLogits: prof.marks.read - prof.marks.flush,
+      tail: t1 - prof.marks.read, dispatches: prof.n };
+    if (mode === 'stamped') {
+      const s = await readStamps(2 * prof.n);
+      const dur = [], gaps = [];
+      for (let i = 0; i < prof.n; i++) {
+        dur.push(Number(s[2 * i + 1] - s[2 * i]));
+        if (i) gaps.push(Number(s[2 * i] - s[2 * i - 1]));
+      }
+      r.passNs = dur; r.gapNs = gaps;
+      r.gpuSpan = Number(s[2 * prof.n - 1] - s[0]) / 1e6;
+      r.gpuBusy = dur.reduce((a, b) => a + b, 0) / 1e6;
+    } else if (mode === 'onepass') {
+      const s = await readStamps(2 * prof.segments);
+      let busy = 0;
+      for (let i = 0; i < prof.segments; i++) busy += Number(s[2 * i + 1] - s[2 * i]);
+      r.gpuBusy = busy / 1e6;
+      r.gpuSpan = Number(s[2 * prof.segments - 1] - s[0]) / 1e6;
+      r.segments = prof.segments;
+    }
+    return r;
+  }
+
+  // Warm every mode once, then interleave rounds so no mode inherits a state
+  // another paid for.
+  const MODES = ['plain', 'stamped', 'onepass'];
+  for (const m of MODES) await step(m);
+  const results = Object.fromEntries(MODES.map((m) => [m, []]));
+  for (let round = 0; round < ROUNDS; round++) {
+    const order = MODES.map((_, i) => MODES[(i + round) % MODES.length]);
+    for (const m of order) {
+      say(`round ${round + 1}/${ROUNDS}: ${m}`);
+      for (let i = 0; i < STEPS; i++) results[m].push(await step(m));
+    }
+  }
+
+  const summary = {};
+  for (const m of MODES) {
+    const rs = results[m];
+    const pick = (k) => rs.map((r) => r[k]).filter((v) => v !== undefined);
+    summary[m] = Object.fromEntries(['wall', 'encode', 'submitToLogits', 'tail', 'gpuSpan', 'gpuBusy']
+      .map((k) => [k, pick(k).length ? +median(pick(k)).toFixed(2) : null]));
+    summary[m].wallMin = +Math.min(...pick('wall')).toFixed(2);
+    summary[m].wallMax = +Math.max(...pick('wall')).toFixed(2);
+    print(`${m.padEnd(8)} ${JSON.stringify(summary[m])}`);
+  }
+
+  // Per-kernel GPU time in situ, by role, median over stamped steps.
+  const st_ = results.stamped;
+  const n = st_[0].passNs.length;
+  const perPass = [];
+  for (let i = 0; i < n; i++) perPass.push(median(st_.map((r) => r.passNs[i])));
+  const perGap = [];
+  for (let i = 0; i < n - 1; i++) perGap.push(median(st_.map((r) => r.gapNs[i])));
+  const names = [];
+  for (let l = 0; l < config.numLayers; l++) for (const k of LAYER_ORDER) names.push(k);
+  names.push('finalNorm', 'lm_head');
+  if (names.length !== n) throw new Error(`expected ${names.length} passes, saw ${n}`);
+  const byRole = {};
+  names.forEach((k, i) => { byRole[k] = (byRole[k] ?? 0) + perPass[i] / 1e6; });
+  const gateByLayer = names.map((k, i) => (k === 'gate' ? +(perPass[i] / 1e3).toFixed(1) : null)).filter((v) => v !== null);
+  print('in situ, ms per token by role: ' + JSON.stringify(Object.fromEntries(Object.entries(byRole).map(([k, v]) => [k, +v.toFixed(3)]))));
+  print('gate us by layer: ' + gateByLayer.join(' '));
+  print(`sum of gaps between passes: ${(perGap.reduce((a, b) => a + b, 0) / 1e6).toFixed(2)} ms, median gap ${(median(perGap) / 1e3).toFixed(1)} us`);
+
+  // ------------------------------------------- isolated, hot vs cold weights --
+  // bench.html's method: one kernel, 256 times, same weights. "cold" rotates
+  // through all 24 layers' weights so consecutive dispatches never share a matrix.
+  async function isolated(role, rows, cols, pickW, input, outBuf, hot) {
+    const { grid, width } = grid2d(rows);
+    const u = ctx.uniform(new Uint32Array([rows, cols, 0, width]));
+    const noBias = ctx.empty(4, 'nb');
+    const REPS = 240;
+    const [ns] = await ctx.timed(1, (e, _i, ts) => {
+      const pass = e.beginComputePass({ timestampWrites: ts });
+      const pipe = ctx.pipeline(MATVEC, 'matvec');
+      pass.setPipeline(pipe);
+      const groups = [];
+      for (let l = 0; l < config.numLayers; l++) {
+        groups.push(dev.createBindGroup({ layout: pipe.getBindGroupLayout(0),
+          entries: [pickW(hot ? 0 : l), input, noBias, outBuf, u].map((buffer, binding) => ({ binding, resource: { buffer } })) }));
+      }
+      for (let r = 0; r < REPS; r++) {
+        pass.setBindGroup(0, groups[r % config.numLayers]);
+        pass.dispatchWorkgroups(grid[0], grid[1], 1);
+      }
+      pass.end();
+    });
+    return ns / REPS;
+  }
+  const ffn = config.intermediateSize;
+  const inF = ctx.empty(ffn * 4, 'inF'), outF = ctx.empty(ffn * 4, 'outF');
+  const L = model.w.layers;
+  const iso = {};
+  for (const [role, rows, cols, pick] of [
+    ['q_proj', d, d, (l) => L[l].wq], ['o_proj', d, d, (l) => L[l].wo],
+    ['gate', ffn, d, (l) => L[l].wGate], ['down', d, ffn, (l) => L[l].wDown]]) {
+    const hot = [], cold = [];
+    for (let r = 0; r < 3; r++) {
+      hot.push(await isolated(role, rows, cols, pick, inF, outF, true));
+      cold.push(await isolated(role, rows, cols, pick, inF, outF, false));
+    }
+    const insitu = median(names.map((k, i) => (k === role ? perPass[i] : null)).filter((v) => v !== null));
+    const bytes = rows * cols * 2;
+    iso[role] = { hotUs: +(median(hot) / 1e3).toFixed(1), coldUs: +(median(cold) / 1e3).toFixed(1),
+      inSituUs: +(insitu / 1e3).toFixed(1), inSituGBs: +(bytes / insitu).toFixed(1),
+      coldGBs: +(bytes / median(cold)).toFixed(1), hotGBs: +(bytes / median(hot)).toFixed(1) };
+    print(`${role.padEnd(7)} ${JSON.stringify(iso[role])}`);
+  }
+  const lmIdx = names.indexOf('lm_head');
+  const lmBytes = config.vocabSize * d * 2;
+  print(`lm_head in situ ${(perPass[lmIdx] / 1e6).toFixed(2)} ms = ${(lmBytes / perPass[lmIdx]).toFixed(1)} GB/s`);
+
+  // ----------------------------------------------------- bandwidth ceiling --
+  // A pure read of the 272 MB embedding matrix, coalesced, at several load
+  // widths and occupancies. No arithmetic worth the name, so this is what the
+  // memory system gives a WebGPU kernel on this adapter.
+  async function readBW(kind, groups) {
+    const T = kind === 'vec4' ? 'vec4<u32>' : kind === 'vec2' ? 'vec2<u32>' : 'u32';
+    const fold = kind === 'vec4' ? 'acc.x ^ acc.y ^ acc.z ^ acc.w' : kind === 'vec2' ? 'acc.x ^ acc.y' : 'acc';
+    const zero = kind === 'u32' ? '0u' : `${T}(0u)`;
+    const code = `
+@group(0) @binding(0) var<storage, read> src : array<${T}>;
+@group(0) @binding(1) var<storage, read_write> dst : array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g : vec3<u32>, @builtin(num_workgroups) nw : vec3<u32>) {
+  let n = arrayLength(&src);
+  let stride = nw.x * 256u;
+  var acc = ${zero};
+  var i = g.x;
+  loop { if (i >= n) { break; } acc = acc ^ src[i]; i = i + stride; }
+  dst[g.x] = ${fold};
+}`;
+    const dst = ctx.empty(groups * 256 * 4, 'bwdst');
+    const pipe = ctx.pipeline(code, `bw-${kind}`);
+    const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: model.w.embed } }, { binding: 1, resource: { buffer: dst } }] });
+    const REPS = 8;
+    const runs = [];
+    for (let r = 0; r < 3; r++) {
+      const [ns] = await ctx.timed(1, (e, _i, ts) => {
+        const pass = e.beginComputePass({ timestampWrites: ts });
+        pass.setPipeline(pipe); pass.setBindGroup(0, bg);
+        for (let k = 0; k < REPS; k++) pass.dispatchWorkgroups(groups);
+        pass.end();
+      });
+      runs.push(ns / REPS);
+    }
+    dst.destroy();
+    const bytes = Math.floor(model.w.embed.size / (kind === 'vec4' ? 16 : kind === 'vec2' ? 8 : 4)) * (kind === 'vec4' ? 16 : kind === 'vec2' ? 8 : 4);
+    return +(bytes / median(runs)).toFixed(1);
+  }
+  const bw = {};
+  for (const kind of ['u32', 'vec2', 'vec4']) {
+    for (const groups of [256, 1024, 4096]) bw[`${kind}x${groups}`] = await readBW(kind, groups);
+  }
+  print('pure-read GB/s over 272 MB: ' + JSON.stringify(bw));
+
+  // ---------------------------------------------- bind-group cache hit cost --
+  {
+    const pipe = ctx.pipeline(MATVEC, 'matvec');
+    const bufs = [model.w.layers[0].wq, inF, inF, outF, ctx.uniform(new Uint32Array([d, d, 0, 32768]))];
+    ctx.bindGroup(pipe, bufs);
+    const t = performance.now();
+    for (let i = 0; i < 3620; i++) ctx.bindGroup(pipe, bufs);
+    print(`bind group cache hit: ${((performance.now() - t) / 10).toFixed(3)} ms per 362 dispatches`);
+  }
+
+  // ------------------------------------------------------ fixed latencies --
+  const lat = { emptySubmit: [], read4B: [], read608KB: [] };
+  const logitBuf = model.scratch.get('logits').buffer;
+  for (let r = 0; r < 20; r++) {
+    let t = performance.now();
+    dev.queue.submit([dev.createCommandEncoder().finish()]);
+    await origDone();
+    lat.emptySubmit.push(performance.now() - t);
+    t = performance.now(); await origRead(logitBuf, 1); lat.read4B.push(performance.now() - t);
+    t = performance.now(); await origRead(logitBuf, config.vocabSize); lat.read608KB.push(performance.now() - t);
+  }
+  const latency = Object.fromEntries(Object.entries(lat).map(([k, v]) => [k, +median(v).toFixed(2)]));
+  print('fixed latencies, ms: ' + JSON.stringify(latency));
+
+  window.__profile = { latency, summary, byRole, gateByLayer, gapsMs: perGap.reduce((a, b) => a + b, 0) / 1e6,
+    medianGapUs: median(perGap) / 1e3, iso, lmHeadMs: perPass[lmIdx] / 1e6, bw,
+    adapter: ctx.describe(), raw: results };
+  window.__done = true;
+  say('done');
+} catch (error) {
+  window.__done = true;
+  window.__error = String(error) + '\n' + (error.stack ?? '');
+  log.textContent = String(error);
+  out.textContent = error.stack ?? '';
+}
+</script>

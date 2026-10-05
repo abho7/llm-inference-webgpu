@@ -51,15 +51,19 @@ const LAYER_TENSORS = {
 /** Biases stay f32: there are 896 of them per layer and they are added last. */
 const F32_TENSORS = new Set(['bq', 'bk', 'bv']);
 
-function pack(ctx, fields, label) {
+/** The largest parameter block any kernel here takes, in bytes. */
+const UNIFORM_BYTES = 32;
+
+function packFields(fields) {
   const size = Math.max(16, Math.ceil(fields.length / 4) * 16);
+  if (size > UNIFORM_BYTES) throw new Error(`${fields.length} parameters exceed ${UNIFORM_BYTES} bytes`);
   const buf = new ArrayBuffer(size);
   const view = new DataView(buf);
   fields.forEach(([kind, value], i) => {
     if (kind === 'u32') view.setUint32(i * 4, value, true);
     else view.setFloat32(i * 4, value, true);
   });
-  return ctx.uniform(new Uint32Array(buf), label);
+  return new Uint32Array(buf);
 }
 
 export class GpuKVCache {
@@ -93,6 +97,30 @@ export class GpuModel {
     // different order from decode, and is twice as slow at decode itself.
     this.matmul = matmul;
     this.scratch = new Map();
+    // Uniform buffers, reused across forward passes: slot i holds the i-th
+    // parameter block a pass asks for, rewritten each time. Creating ~170
+    // fresh buffers per decode step (and never destroying them) cost more
+    // than every kernel except the matrix products. Each slot is written once
+    // per pass, and a write is queued after the previous pass's submission,
+    // so no pass can see the next one's parameters.
+    this.uniforms = [];
+    this.uniformNext = 0;
+  }
+
+  /** The next parameter block of this pass, in a reused uniform buffer. */
+  #uniform(fields) {
+    const data = packFields(fields);
+    let buffer = this.uniforms[this.uniformNext];
+    if (!buffer) {
+      buffer = this.ctx.device.createBuffer({
+        label: `params${this.uniformNext}`, size: UNIFORM_BYTES,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.uniforms.push(buffer);
+    }
+    this.uniformNext++;
+    this.ctx.device.queue.writeBuffer(buffer, 0, data);
+    return buffer;
   }
 
   /**
@@ -196,7 +224,20 @@ export class GpuModel {
    * `hidden` is the already-embedded input, [seq, hiddenSize], supplied by the
    * caller so that the embedding gather stays on the CPU.
    */
-  async forward(hidden, seq, { cache, wantLogits = true, wantPresent = false } = {}) {
+  async forward(hidden, seq, options) {
+    // One pass at a time. The uniform pool and the logits staging buffer are
+    // reused across passes, and a second pass started while the first waits on
+    // its readback would record into the staging buffer while it is mapping.
+    if (this.running) throw new Error('forward() is already running; await it first');
+    this.running = true;
+    try {
+      return await this.#forward(hidden, seq, options);
+    } finally {
+      this.running = false;
+    }
+  }
+
+  async #forward(hidden, seq, { cache, wantLogits = true, wantPresent = false } = {}) {
     const ctx = this.ctx;
     const cfg = this.config;
     const d = cfg.hiddenSize;
@@ -218,21 +259,26 @@ export class GpuModel {
     // Record the whole forward pass into one command buffer. Submitting each
     // dispatch separately costs more than the dispatches do.
     ctx.begin('forward');
+    this.uniformNext = 0;
 
     const normed = this.#buf('normed', seq * d);
     const q = this.#buf('q', seq * d);
     const k = this.#buf('k', seq * kvDim);
     const v = this.#buf('v', seq * kvDim);
     const attnOut = this.#buf('attnOut', seq * d);
-    const scores = this.#buf('scores', cfg.numHeads * seq * Math.max(total, 1));
+    // Grown in blocks of 256 positions rather than to `total` exactly: decode
+    // adds one position per step, and an exact fit would replace this buffer,
+    // and every bind group holding it, on every token.
+    const scorePositions = Math.ceil(Math.max(total, 1) / 256) * 256;
+    const scores = this.#buf('scores', cfg.numHeads * seq * scorePositions);
     const gate = this.#buf('gate', seq * ffn);
     const up = this.#buf('up', seq * ffn);
     const projected = this.#buf('projected', seq * d);
     const noBias = this.#buf('noBias', 1);
 
-    const normParams = pack(ctx, [['u32', seq], ['u32', d], ['f32', cfg.rmsNormEps], ['u32', 0]]);
-    const addParams = pack(ctx, [['u32', seq * d], ['u32', 0], ['u32', 0], ['u32', 0]]);
-    const swigluParams = pack(ctx, [['u32', seq * ffn], ['u32', 0], ['u32', 0], ['u32', 0]]);
+    const normParams = this.#uniform([['u32', seq], ['u32', d], ['f32', cfg.rmsNormEps], ['u32', 0]]);
+    const addParams = this.#uniform([['u32', seq * d], ['u32', 0], ['u32', 0], ['u32', 0]]);
+    const swigluParams = this.#uniform([['u32', seq * ffn], ['u32', 0], ['u32', 0], ['u32', 0]]);
 
     const batchTile = GpuModel.batchTileFor(seq);
     const mv = (W, input, output, rows, cols, bias) => {
@@ -241,7 +287,7 @@ export class GpuModel {
       // workgroup memory.
       if (this.matmul === 'matvec' || (this.matmul === 'batched' && seq === 1)) {
         const { grid, width } = grid2d(rows);
-        const params = pack(ctx, [
+        const params = this.#uniform([
           ['u32', rows], ['u32', cols], ['u32', bias ? 1 : 0], ['u32', width],
         ]);
         ctx.dispatch(MATVEC, [W, input, bias ?? noBias, output, params],
@@ -251,7 +297,7 @@ export class GpuModel {
       if (this.matmul === 'batched') {
         // One workgroup per row, per tile of positions.
         const { grid, width } = grid2d(rows);
-        const params = pack(ctx, [
+        const params = this.#uniform([
           ['u32', rows], ['u32', cols], ['u32', bias ? 1 : 0], ['u32', width],
           ['u32', seq], ['u32', 0], ['u32', 0], ['u32', 0],
         ]);
@@ -262,7 +308,7 @@ export class GpuModel {
       if (this.matmul !== 'tiled') throw new Error(`unknown matmul path '${this.matmul}'`);
       // One workgroup per tile of rows, per tile of positions.
       const { grid, width } = grid2d(Math.ceil(rows / TILE_ROWS));
-      const params = pack(ctx, [
+      const params = this.#uniform([
         ['u32', rows], ['u32', cols], ['u32', bias ? 1 : 0], ['u32', width],
         ['u32', seq], ['u32', 0], ['u32', 0], ['u32', 0],
       ]);
@@ -278,8 +324,8 @@ export class GpuModel {
       mv(w.wk, normed, k, kvDim, d, w.bk);
       mv(w.wv, normed, v, kvDim, d, w.bv);
 
-      const ropeQ = pack(ctx, [['u32', seq], ['u32', cfg.numHeads], ['u32', cfg.headDim], ['u32', past]]);
-      const ropeK = pack(ctx, [['u32', seq], ['u32', cfg.numKVHeads], ['u32', cfg.headDim], ['u32', past]]);
+      const ropeQ = this.#uniform([['u32', seq], ['u32', cfg.numHeads], ['u32', cfg.headDim], ['u32', past]]);
+      const ropeK = this.#uniform([['u32', seq], ['u32', cfg.numKVHeads], ['u32', cfg.headDim], ['u32', past]]);
       const qPairs = seq * cfg.numHeads * (cfg.headDim / 2);
       const kPairs = seq * cfg.numKVHeads * (cfg.headDim / 2);
       ctx.dispatch(ROPE, [q, this.ropeTable.cos, this.ropeTable.sin, ropeQ],
@@ -291,7 +337,7 @@ export class GpuModel {
       ctx.copy(k, 0, cache.keys[layer], past * kvDim * 4, seq * kvDim * 4);
       ctx.copy(v, 0, cache.values[layer], past * kvDim * 4, seq * kvDim * 4);
 
-      const attnParams = pack(ctx, [
+      const attnParams = this.#uniform([
         ['u32', seq], ['u32', past], ['u32', cfg.numHeads], ['u32', cfg.numKVHeads],
         ['u32', cfg.headDim], ['u32', cfg.kvGroupSize], ['u32', total], ['u32', 0],
       ]);
@@ -319,20 +365,21 @@ export class GpuModel {
       const lastRow = this.#buf('lastRow', d);
       ctx.copy(x, (seq - 1) * d * 4, lastRow, 0, d * 4);
 
-      const oneRowNorm = pack(ctx, [['u32', 1], ['u32', d], ['f32', cfg.rmsNormEps], ['u32', 0]]);
+      const oneRowNorm = this.#uniform([['u32', 1], ['u32', d], ['f32', cfg.rmsNormEps], ['u32', 0]]);
       const normedLast = this.#buf('normedLast', d);
       ctx.dispatch(RMSNORM, [lastRow, this.w.finalNorm, normedLast, oneRowNorm], [1], 'finalNorm');
 
       const logitBuf = this.#buf('logits', cfg.vocabSize);
       const { grid, width } = grid2d(cfg.vocabSize);
-      const params = pack(ctx, [
+      const params = this.#uniform([
         ['u32', cfg.vocabSize], ['u32', d], ['u32', 0], ['u32', width],
       ]);
       ctx.dispatch(MATVEC, [this.w.embed, normedLast, noBias, logitBuf, params],
         [grid[0], grid[1], 1], 'lm_head');
+      // The copy rides in the same submission, so mapping it is the only wait.
+      const read = ctx.stageRead(logitBuf, cfg.vocabSize);
       ctx.flush();
-      await ctx.done();
-      logits = await ctx.readF32(logitBuf, cfg.vocabSize);
+      logits = await read();
     }
 
     ctx.flush();
@@ -349,7 +396,8 @@ export class GpuModel {
       }
     }
 
-    await ctx.done();
+    // A mapped readback already waited for the whole submission.
+    if (!logits || present) await ctx.done();
     return { logits, present, hiddenBuffer: x };
   }
 }
