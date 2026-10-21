@@ -32,11 +32,9 @@ import time
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-MODEL = pathlib.Path(os.environ.get(
-    "ONNX_ORACLE",
-    r"C:\Users\satya\AppData\Local\Temp\claude\C--Users-satya"
-    r"\ae58224e-4cb9-461c-bef2-1ab46f9420ae\scratchpad\oracle\model.onnx",
-))
+# The ~2 GB ONNX model lives outside version control (*.onnx is ignored):
+# set ONNX_ORACLE to its path, or place it at weights/onnx/model.onnx.
+MODEL = pathlib.Path(os.environ.get("ONNX_ORACLE", ROOT / "weights" / "onnx" / "model.onnx"))
 
 PROMPT = (
     "The theory of computation asks what problems can be solved by machines, and how much "
