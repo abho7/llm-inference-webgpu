@@ -34,12 +34,9 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / "golden" / "reference"
 
 # The oracle model is not in the repository: it is ~2 GB, and *.onnx is
-# gitignored. Point this at wherever it was downloaded.
-MODEL = pathlib.Path(os.environ.get(
-    "ONNX_ORACLE",
-    r"C:\Users\satya\AppData\Local\Temp\claude\C--Users-satya"
-    r"\ae58224e-4cb9-461c-bef2-1ab46f9420ae\scratchpad\oracle\model.onnx",
-))
+# gitignored. Set ONNX_ORACLE to wherever it was downloaded, or place it at
+# weights/onnx/model.onnx.
+MODEL = pathlib.Path(os.environ.get("ONNX_ORACLE", ROOT / "weights" / "onnx" / "model.onnx"))
 
 PROMPTS = [
     # Short, because every extra token multiplies 48 present tensors. Chosen to
